@@ -55,6 +55,19 @@ function fixture() {
 }
 
 describe("callback bridge arguments", () => {
+	it("defaults an origin-only command to browser return without a cloud transport", () => {
+		expect(parseBridgeArguments(["--origin", "https://example.com"])).toEqual({
+			action: "run",
+			remoteOrigin: "https://example.com",
+			target: { kind: "browser" },
+		});
+		expect(parseBridgeArguments(["install", "--origin", "https://example.com"])).toEqual({
+			action: "install",
+			remoteOrigin: "https://example.com",
+			target: { kind: "browser" },
+		});
+	});
+
 	it("accepts an SSH profile and canonical HTTPS origin", () => {
 		expect(parseBridgeArguments(["run", "--origin", "https://EXAMPLE.com/", "--ssh-host", "user@dsh-example"])).toEqual(
 			{ action: "run", remoteOrigin: "https://example.com", target: { kind: "ssh", host: "user@dsh-example" } },
@@ -94,6 +107,8 @@ describe("callback bridge arguments", () => {
 		["--origin", "https://example.com", "--ssh-host", "-oProxyCommand=example"],
 		["--origin", "https://example.com", "--ssh-host", "host;example"],
 		["--origin", "https://example.com", "--gcp-instance", "example-vm"],
+		["--origin", "https://example.com", "--gcp-project", "example-project"],
+		["--origin", "https://example.com", "--gcp-zone", "us-central1-a"],
 		["uninstall", ...SSH_ARGS],
 	])("rejects unsafe or incomplete input %j", (...args) => {
 		expect(() => parseBridgeArguments(args)).toThrow();
@@ -109,6 +124,20 @@ describe("callback bridge arguments", () => {
 });
 
 describe("callback bridge process lifecycle", () => {
+	it("starts browser-return mode without executing SSH or GCP discovery", async () => {
+		const { dependencies, signals, close } = fixture();
+		const running = runCallbackBridgeCli(["run", "--origin", "https://example.com"], dependencies);
+		await vi.waitFor(() => expect(dependencies.start).toHaveBeenCalled());
+		expect(dependencies.start).toHaveBeenCalledWith({
+			remoteOrigin: "https://example.com",
+			target: { kind: "browser" },
+		});
+		expect(dependencies.exec).not.toHaveBeenCalled();
+		signals.get("SIGTERM")?.();
+		expect(await running).toBe(0);
+		expect(close).toHaveBeenCalledTimes(1);
+	});
+
 	it.each(["SIGINT", "SIGTERM"] as const)("closes its bridge once on %s and removes both handlers", async (signal) => {
 		const { dependencies, signals, close } = fixture();
 		const running = runCallbackBridgeCli(SSH_ARGS, dependencies);
@@ -150,6 +179,15 @@ describe("callback bridge process lifecycle", () => {
 });
 
 describe("per-user macOS bridge installer", () => {
+	it("installs the default origin-only browser mode without cloud configuration", async () => {
+		const { dependencies, files, path } = fixture();
+		expect(await runCallbackBridgeCli(["install", "--origin", "https://example.com"], dependencies)).toBe(0);
+		expect(files.get(path)).toContain("<string>--origin</string>");
+		expect(files.get(path)).not.toContain("--gcp-");
+		expect(files.get(path)).not.toContain("--ssh-host");
+		expect(dependencies.exec).not.toHaveBeenCalled();
+	});
+
 	it("XML-escapes absolute executable paths and persists only the executable PATH", () => {
 		const plist = bridgeLaunchAgentPlist(CONFIG, '/example<&"/node', "/example'/>/bin.js", "/example<&:/usr/bin");
 		expect(plist).toContain("/example&lt;&amp;&quot;/node");

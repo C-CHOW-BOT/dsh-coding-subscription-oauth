@@ -10,7 +10,7 @@ All notable changes to `dsh-coding-subscription-oauth` are documented here, foll
 
 ### Added
 
-- Optional local Claude callback bridge with SSH/IAP transport, connection readiness checks before authorization, automatic callback forwarding, and a per-user macOS startup installer. Remote Accounts settings offer automatic sign-in with callback paste as a fallback.
+- Local Claude callback bridge with automatic browser return through DSH's existing authenticated sign-in route, receiver readiness before authorization, and a per-user macOS startup installer. The default needs no SSH or cloud access; explicit SSH/IAP forwarding remains available. Remote Accounts settings offer automatic sign-in with callback paste as a fallback.
 
 ## v0.8.5 - 2026-09-15
 

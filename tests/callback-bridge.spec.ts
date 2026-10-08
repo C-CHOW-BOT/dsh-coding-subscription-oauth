@@ -69,7 +69,14 @@ class FakeTunnel extends EventEmitter {
 }
 
 async function fixture(
-	options: { ready?: boolean; callbackStatus?: number; target?: BridgeTarget; ttl?: number; ignoreTerm?: boolean } = {},
+	options: {
+		ready?: boolean;
+		callbackStatus?: number;
+		target?: BridgeTarget;
+		ttl?: number;
+		ignoreTerm?: boolean;
+		beforeBrowserReady?: () => Promise<void>;
+	} = {},
 ) {
 	const callbacks: string[] = [];
 	let ready = options.ready ?? true;
@@ -111,6 +118,7 @@ async function fixture(
 			sessionTimeoutMs: options.ttl ?? 5000,
 			pollIntervalMs: 10,
 			killTimeoutMs: 15,
+			...(options.beforeBrowserReady === undefined ? {} : { beforeBrowserReady: options.beforeBrowserReady }),
 			spawnTunnel: (command, args) => {
 				child.alive = true;
 				forward.listen(forwardPort, "127.0.0.1");
@@ -164,6 +172,104 @@ async function fixture(
 }
 
 describe("local Claude callback bridge", () => {
+	it("reuses a fully ready browser challenge and replaces only its owned cancelled attempt for a new state", async () => {
+		const f = await fixture({ target: { kind: "browser" } });
+		expect((await f.start()).status).toBe(200);
+		expect((await f.start()).status).toBe(200);
+		const freshAuth = authUrl.replace("state=fixture-state", "state=fresh-state");
+		expect((await f.start({ authUrl: freshAuth, remoteOrigin })).status).toBe(200);
+		const callback = `http://127.0.0.1:${f.callbackPort}/callback`;
+		expect((await fetch(`${callback}?code=old-code&state=fixture-state`)).status).toBe(400);
+		const accepted = await fetch(`${callback}?code=fresh-code&state=fresh-state`, { redirect: "manual" });
+		expect(accepted.status).toBe(303);
+		const fragment = new URL(accepted.headers.get("location") ?? "").hash;
+		expect(new URLSearchParams(fragment.slice(1)).get("dsh-claude-callback")).toBe(
+			"http://localhost:53692/callback?code=fresh-code&state=fresh-state",
+		);
+		expect(f.spawns).toHaveLength(0);
+		expect(f.child.signals).toHaveLength(0);
+	});
+
+	it("does not claim an identical browser challenge is ready while its callback setup is pending", async () => {
+		let entered = false;
+		let ready: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			ready = resolve;
+		});
+		const f = await fixture({
+			target: { kind: "browser" },
+			beforeBrowserReady: async () => {
+				entered = true;
+				await gate;
+			},
+		});
+		const first = f.start();
+		await expect.poll(() => entered).toBe(true);
+		try {
+			expect((await f.start()).status).toBe(409);
+		} finally {
+			ready();
+		}
+		expect((await first).status).toBe(200);
+		expect((await f.start()).status).toBe(200);
+	});
+
+	it("returns matching browser callbacks through an exact remote-origin fragment without SSH, IAM or claiming a forward port", async () => {
+		const f = await fixture({ target: { kind: "browser" } });
+		const incumbent = createServer((_req, res) => res.end("existing local service"));
+		await new Promise<void>((resolve) => incumbent.listen(f.forwardPort, "127.0.0.1", resolve));
+		cleanup.push(() => close(incumbent));
+		expect((await f.start()).status).toBe(200);
+		expect(f.spawns).toHaveLength(0);
+		const callback = `http://127.0.0.1:${f.callbackPort}/callback`;
+		expect((await fetch(`${callback}?code=fixture-code&state=wrong`)).status).toBe(400);
+		expect((await fetch(`${callback}?code=fixture-code&state=fixture-state&state=second`)).status).toBe(400);
+		expect((await fetch(`${callback}?code=fixture-code&code=second&state=fixture-state`)).status).toBe(400);
+		const response = await fetch(`${callback}?code=fixture-code&state=fixture-state&next=https://evil.example.com/`, {
+			redirect: "manual",
+		});
+		expect(response.status).toBe(303);
+		const location = new URL(response.headers.get("location") ?? "");
+		expect(location.origin).toBe(remoteOrigin);
+		expect(location.pathname).toBe("/");
+		expect(location.search).toBe("");
+		expect(new URLSearchParams(location.hash.slice(1)).get("dsh-claude-callback")).toBe(
+			"http://localhost:53692/callback?code=fixture-code&state=fixture-state",
+		);
+		expect(response.headers.get("referrer-policy")).toBe("no-referrer");
+		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(await response.text()).not.toContain("fixture-code");
+		expect(f.callbacks).toHaveLength(0);
+		expect(f.child.signals).toHaveLength(0);
+		expect(await (await fetch(`http://127.0.0.1:${f.forwardPort}`)).text()).toBe("existing local service");
+		await expect
+			.poll(async () => {
+				const proof = createServer();
+				const free = await new Promise<boolean>((resolve) => {
+					proof.once("error", () => resolve(false));
+					proof.listen(f.callbackPort, "127.0.0.1", () => resolve(true));
+				});
+				await close(proof);
+				return free;
+			})
+			.toBe(true);
+		expect((await f.pageToken()).response.status).toBe(200);
+	});
+
+	it("bounds a browser-only session and does not reflect arbitrary callback errors", async () => {
+		const f = await fixture({ target: { kind: "browser" }, ttl: 50 });
+		expect((await f.start()).status).toBe(200);
+		const declined = await fetch(
+			`http://127.0.0.1:${f.callbackPort}/callback?error=private-provider-detail&state=fixture-state`,
+		);
+		expect(declined.status).toBe(400);
+		expect(await declined.text()).not.toContain("private-provider-detail");
+		await expect.poll(async () => (await f.start()).status).toBe(200);
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		expect((await f.start()).status).toBe(200);
+		expect(f.spawns).toHaveLength(0);
+	});
+
 	it("requires the configured remote referrer and erases fragment before a one-time same-origin POST", async () => {
 		const f = await fixture();
 		expect((await fetch(f.bridge.url)).status).toBe(403);

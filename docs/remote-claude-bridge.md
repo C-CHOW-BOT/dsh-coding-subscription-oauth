@@ -1,74 +1,88 @@
 # Remote Claude sign-in with the local callback bridge
 
-Install the bridge on the computer running your browser. Configure it to connect to the same remote machine running DSH. Claude still redirects to `http://localhost:53692/callback`; the bridge forwards that callback through SSH. Claude credentials are exchanged and stored by remote DSH.
+The default bridge receives Claude's localhost callback and automatically returns it to your configured DSH website. Your authenticated DSH webpage submits the callback through its existing login API. Remote DSH validates OAuth state and PKCE, exchanges credentials, and stores them. This mode needs Node.js on your browser's computer; it needs no SSH, Google Cloud login, or VM access.
 
 ## First-time setup
 
-Use Node.js `^22.19.0 || >=24` and a package build containing the `dsh-claude-bridge` command. For an unpublished development build, build and verify the checkout, pack it, then install its tarball globally:
+Use Node.js `^22.19.0 || >=24` and a package build containing `dsh-claude-bridge`. For an unpublished development build, verify the checkout, pack it, and install its tarball globally:
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm run check
 npm pack --ignore-scripts
-npm install --global ./dsh-coding-subscription-oauth-<version>.tgz
+npm install --global ./dsh-coding-subscription-oauth-VERSION.tgz
 ```
 
-Keep that package and Node installation at stable locations if installing the macOS background service. Its LaunchAgent records absolute executable paths and the current executable `PATH`, including any installed `gcloud` command. It does not copy the rest of your environment or store account credentials.
+Replace `VERSION` with the version of the generated tarball. Use a stable package and Node installation if you will install the macOS background service.
 
-For ordinary SSH, first connect interactively to your configured SSH alias and verify its host identity. Configure working key authentication. The bridge will not accept a new host key or bypass host-key checks.
+Start a foreground helper with your exact DSH HTTPS origin:
+
+```bash
+dsh-claude-bridge run --origin https://example.com
+```
+
+Replace `https://example.com` with the website where you use DSH. The origin must have no path, query, credentials, or fragment. Other websites cannot start a login through this configured helper. Keep `run` active during sign-in; Ctrl+C or SIGTERM closes its own listeners.
+
+## Start automatically on macOS
+
+After verifying the foreground helper, stop it with Ctrl+C and install the background helper once:
+
+```bash
+dsh-claude-bridge install --origin https://example.com
+```
+
+This starts a per-user LaunchAgent immediately and again when you log in. The file has mode `0600` and label `io.dsh.claude-callback-bridge`. It records absolute Node and CLI paths, connection arguments, and your executable `PATH`; it does not copy the rest of your environment or store account credentials.
+
+Repeating an identical installation is safe. A conflicting file or configuration is preserved. To change an owned installation, uninstall it and install the intended configuration. Do not overwrite an unrelated LaunchAgent. Starting the local helper does not require a DSH restart. On other systems, use the foreground `run` command.
+
+## Default sign-in flow
+
+1. In remote DSH, choose the local bridge sign-in option.
+2. The browser navigates to `http://127.0.0.1:53700/start`. The helper checks the configured DSH origin and pending Claude challenge. This is a top-level navigation, not a cross-origin browser fetch.
+3. The helper opens its localhost callback receiver at port `53692` before opening Claude.
+4. Authorize with Claude. Its callback reaches the local receiver, which checks that it belongs to the pending attempt.
+5. The helper returns your browser to the exact configured DSH origin with the callback in a URL fragment. The authenticated DSH page consumes the fragment and automatically submits the callback, without reading or copying your clipboard.
+6. DSH completes credential exchange and updates its actual account status. Keep DSH Settings open to see the final result.
+
+The callback fragment stays in the browser and is not sent in the initial website HTTP request. DSH removes it after consuming it. The helper does not receive your DSH browser cookies or store Claude tokens.
+
+A received callback or a browser return does not prove that credential exchange and storage succeeded. DSH's signed-in status is authoritative. A pending helper attempt expires after five minutes. Use a new DSH authorization attempt after a timeout or failure; existing authenticated accounts are independent of a pending attempt.
+
+## Optional SSH or Google Cloud forwarding
+
+If you already have access to the machine running DSH, the helper can forward the callback directly to its native callback listener instead of returning it through the browser. Configure exactly one transport and the same machine that generated the DSH challenge.
+
+For SSH, first connect interactively to your SSH alias, verify its identity, and configure key authentication. The helper does not accept new host keys or bypass host-key checks.
 
 ```bash
 ssh dsh-example
 dsh-claude-bridge run --origin https://example.com --ssh-host dsh-example
 ```
 
-For Google Cloud IAP, install the Google Cloud CLI, authenticate it yourself, and verify that your account can connect to the selected instance. The bridge does not run a login command, grant access, or change IAM.
+For Google Cloud IAP, install the Google Cloud CLI, authenticate it yourself, and verify access to the selected instance:
 
 ```bash
 gcloud compute ssh example-vm --project example-project --zone us-central1-a --tunnel-through-iap
 dsh-claude-bridge run --origin https://example.com --gcp-instance example-vm --gcp-project example-project --gcp-zone us-central1-a
 ```
 
-If you do not know the instance name, use `--gcp-instance auto` and omit the zone:
+If you do not know the instance name, use automatic discovery:
 
 ```bash
 dsh-claude-bridge run --origin https://example.com --gcp-instance auto --gcp-project example-project
 ```
 
-Automatic discovery uses your already active `gcloud` account. Within the configured project, it requires exactly one instance with label `workload=devbox` and `owner-email` metadata matching that account, and the instance must be running. It derives the instance name and zone without displaying the inventory or account metadata. It does not switch accounts or authenticate on your behalf. The same automatic options work with `install`; discovery happens when the helper starts, rather than during installation.
+Discovery uses your already active `gcloud` account. It requires exactly one running instance in the configured project with label `workload=devbox` and `owner-email` metadata matching that account, and derives its name and zone without displaying the inventory. The helper does not switch accounts, authenticate, grant access, or change IAM. The same options work with `install`; discovery runs when the helper starts.
 
-Replace `https://example.com` with your DSH origin and configure only one transport. An SSH alias may include `user@hostname`. The configured origin is exact; other websites cannot start a login through this bridge.
+Forwarding readiness is bounded to 30 seconds. Native callback HTTP `200` means delivery, not successful credential exchange. DSH's final account status remains authoritative. Optional forwarding uses local port `53694` temporarily, in addition to the callback receiver and helper control listener.
 
-## Start automatically on macOS
+## Failures and fallback
 
-Run `install` once with the same connection options after verifying a foreground run:
-
-```bash
-dsh-claude-bridge install --origin https://example.com --ssh-host dsh-example
-```
-
-Or use the GCP instance, project and zone options with `install`. This starts a per-user LaunchAgent immediately and again when you log in. The file has mode `0600` and label `io.dsh.claude-callback-bridge`. Repeating an identical installation is safe. A conflicting file or configuration is preserved; inspect it, uninstall the owned bridge, and reinstall deliberately to change the connection target. No DSH restart is needed to start the local helper.
-
-On other systems, keep `run` active during sign-in. Ctrl+C or SIGTERM closes the helper's own listener and tunnel.
-
-## Sign-in flow
-
-1. In remote DSH, choose the local bridge sign-in option.
-2. The browser opens a top-level local bridge page at `http://127.0.0.1:53700/start`. This is a navigation, not a cross-origin browser fetch. The bridge checks the configured DSH origin and pending Claude challenge.
-3. The bridge prepares its loopback callback receiver at port `53692`, establishes SSH forwarding, and verifies readiness before opening Claude.
-4. Authorize with Claude. The bridge forwards the matching callback to remote DSH without copying or reading your clipboard.
-5. DSH verifies OAuth state and PKCE, exchanges credentials, and updates its existing account status. Keep the DSH settings page open to see the final result.
-
-An HTTP `200` from the native callback receiver means the callback was delivered. It does not prove that credential exchange or storage succeeded. DSH's actual signed-in status is authoritative. The helper stops its temporary tunnel after callback delivery, cancellation, failure, or its bounded sign-in timeout; the background helper remains available for your next login.
-
-## Connection failures and fallback
-
-- **Local port occupied:** stop the other callback helper or foreground bridge and retry. The bridge does not terminate an unrelated process. Its control listener uses port `53700`; its active Claude callback uses port `53692`.
-- **SSH identity or authentication failure:** establish and verify the SSH connection interactively first. Do not disable known-host checks.
-- **GCP needs reauthentication:** authenticate the Google Cloud CLI yourself, verify the IAP connection, then retry sign-in. The bridge will not prompt for credentials in the background.
-- **Wrong remote machine:** use the machine that generated the pending DSH authorization challenge. The receiver becomes ready only after its tunnel reaches the expected callback listener.
-- **Timeout or canceled attempt:** start a new login. Preparation is bounded to 30 seconds and a pending bridge sign-in expires after five minutes.
-- **Helper unavailable:** use the existing browser sign-in fallback. After Claude redirects, copy the complete callback address and paste it into DSH; DSH validates and submits it automatically.
+- **Local port occupied:** stop the other foreground bridge or callback helper and retry. This helper does not terminate unrelated processes. Its control listener uses port `53700`; an active Claude callback uses port `53692`.
+- **Default browser return cannot complete:** remain signed in to the configured DSH website and retry a fresh attempt. Token exchange errors appear in DSH rather than being reported as a successful connection.
+- **Optional SSH or IAP fails:** verify access interactively first, or reinstall the default origin-only mode. Google Cloud authentication and VM permissions are unnecessary for the default flow.
+- **Expired or canceled attempt:** start a fresh login and use its own authorization page. The local callback receiver has a bounded lifetime.
+- **Helper unavailable:** use the existing browser sign-in fallback. Copy the complete Claude callback address and paste it into DSH; DSH validates and submits it automatically.
 
 ## Remove the macOS background helper
 
@@ -76,4 +90,4 @@ An HTTP `200` from the native callback receiver means the callback was delivered
 dsh-claude-bridge uninstall
 ```
 
-This unloads and removes only the LaunchAgent owned by this command. Other LaunchAgents, your SSH/GCP configuration, the DSH service, and provider credentials are preserved. Stop any separately started foreground `run` process with Ctrl+C.
+This unloads and removes only its owned LaunchAgent. Other LaunchAgents, SSH/GCP configuration, the DSH service, and provider credentials are preserved. Stop a separately started foreground `run` process with Ctrl+C.

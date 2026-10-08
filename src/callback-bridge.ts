@@ -4,6 +4,7 @@ import { createServer, type IncomingMessage, request, type Server, type ServerRe
 import { createServer as createTcpServer } from "node:net";
 
 export type BridgeTarget =
+	| { kind: "browser" }
 	| { kind: "ssh"; host: string }
 	| { kind: "gcp"; instance: string; project: string; zone: string };
 
@@ -20,6 +21,7 @@ export interface CallbackBridgeOptions {
 		allowHttpOrigin?: boolean;
 		spawnTunnel?: (command: string, args: string[]) => TunnelProcess;
 		spawnOwnsProcessGroup?: boolean;
+		beforeBrowserReady?: () => Promise<void>;
 		readyTimeoutMs?: number;
 		sessionTimeoutMs?: number;
 		pollIntervalMs?: number;
@@ -35,6 +37,7 @@ interface ActiveSession {
 	timer?: ReturnType<typeof setTimeout>;
 	healthTimer?: ReturnType<typeof setTimeout>;
 	stopped: boolean;
+	ready: boolean;
 	used: boolean;
 	stop: () => Promise<void>;
 }
@@ -85,7 +88,10 @@ function authorization(input: unknown): { url: string; state: string } {
 	return { url: url.href, state };
 }
 
-function tunnelCommand(target: BridgeTarget, forwardPort: number): { command: string; args: string[] } {
+function tunnelCommand(
+	target: Exclude<BridgeTarget, { kind: "browser" }>,
+	forwardPort: number,
+): { command: string; args: string[] } {
 	const flags = [
 		"-N",
 		"-T",
@@ -296,7 +302,7 @@ export async function startCallbackBridge(
 	const remoteOrigin = configuredOrigin(options.remoteOrigin, options._test?.allowHttpOrigin);
 	const callbackPort = options._test?.callbackPort ?? CALLBACK_PORT;
 	const forwardPort = options._test?.forwardPort ?? FORWARD_PORT;
-	const command = tunnelCommand(options.target, forwardPort);
+	const command = options.target.kind === "browser" ? undefined : tunnelCommand(options.target, forwardPort);
 	const readyTimeout = options._test?.readyTimeoutMs ?? 30_000;
 	const sessionTimeout = options._test?.sessionTimeoutMs ?? 5 * 60_000;
 	const killTimeout = options._test?.killTimeoutMs ?? 1500;
@@ -316,7 +322,13 @@ export async function startCallbackBridge(
 
 	async function begin(auth: { url: string; state: string }): Promise<void> {
 		if (active || closed) throw new Error("Another login is active. Finish it before trying again.");
-		const session: ActiveSession = { state: auth.state, stopped: false, used: false, stop: async () => {} };
+		const session: ActiveSession = {
+			state: auth.state,
+			stopped: false,
+			ready: false,
+			used: false,
+			stop: async () => {},
+		};
 		active = session;
 		let stopping: Promise<void> | undefined;
 		let finishInitialization: () => void = () => {};
@@ -339,7 +351,7 @@ export async function startCallbackBridge(
 		};
 		try {
 			try {
-				await checkForwardPort(forwardPort);
+				if (command) await checkForwardPort(forwardPort);
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code === "EADDRINUSE")
 					throw new Error("The local tunnel port is already in use. Close the other connection and retry.");
@@ -378,6 +390,19 @@ export async function startCallbackBridge(
 					res.once("close", () => {
 						void session.stop();
 					});
+					if (!command) {
+						const callback = new URL(REDIRECT_URI);
+						callback.search = new URLSearchParams({ code, state }).toString();
+						const destination = new URL("/", remoteOrigin);
+						destination.hash = new URLSearchParams({ "dsh-claude-callback": callback.href }).toString();
+						headers(res, "text/html");
+						res.writeHead(303, { Location: destination.href });
+						res.once("finish", () => {
+							void session.stop();
+						});
+						res.end("<!doctype html><title>Returning to DSH</title><p>Returning to DSH to finish sign-in…</p>");
+						return;
+					}
 					try {
 						const result = await forwardedGet(forwardPort, `/callback?${new URLSearchParams({ code, state })}`);
 						if (result.status !== 200) throw new Error("Callback was not accepted.");
@@ -407,6 +432,16 @@ export async function startCallbackBridge(
 				if (!["EAFNOSUPPORT", "EADDRNOTAVAIL"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
 			}
 			if (session.stopped) throw new Error("Login was cancelled.");
+			session.timer = setTimeout(() => {
+				void session.stop();
+			}, sessionTimeout);
+			if (!command) {
+				await options._test?.beforeBrowserReady?.();
+				if (session.stopped) throw new Error("Login was cancelled.");
+				session.ready = true;
+				finishInitialization();
+				return;
+			}
 			session.tunnel = spawnTunnel(command.command, [...command.args]);
 			if (options._test?.spawnOwnsProcessGroup) ownedGroups.add(session.tunnel);
 			session.tunnel.once("error", () => {
@@ -415,9 +450,6 @@ export async function startCallbackBridge(
 			session.tunnel.once("exit", () => {
 				void session.stop();
 			});
-			session.timer = setTimeout(() => {
-				void session.stop();
-			}, sessionTimeout);
 			const deadline = Date.now() + readyTimeout;
 			while (Date.now() < deadline && !session.stopped) {
 				try {
@@ -447,6 +479,7 @@ export async function startCallbackBridge(
 							void checkRemote();
 						}, options._test?.pollIntervalMs ?? 1000);
 						finishInitialization();
+						session.ready = true;
 						return;
 					}
 				} catch {
@@ -518,6 +551,15 @@ export async function startCallbackBridge(
 				auth = authorization(value.authUrl);
 			} catch {
 				return json(res, 400, { error: "Invalid Claude authorization request." });
+			}
+			if (active && !command) {
+				if (active.state === auth.state) {
+					if (!active.ready || active.stopped || active.used)
+						return json(res, 409, { error: "This login is still preparing. Retry shortly." });
+					return json(res, 200, { authUrl: auth.url });
+				}
+				// A new authenticated DSH challenge replaces only our old browser attempt.
+				await active.stop();
 			}
 			if (active) return json(res, 409, { error: "Another login is active. Finish it before trying again." });
 			try {

@@ -96,7 +96,9 @@ export function parseBridgeArguments(args: readonly string[]): BridgeCliCommand 
 	const zone = values.get("--gcp-zone");
 	const safeName = (value: string): boolean => /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,252}$/u.test(value);
 	let target: BridgeCliConfig["target"];
-	if (host !== undefined) {
+	if (host === undefined && instance === undefined && project === undefined && zone === undefined) {
+		target = { kind: "browser" };
+	} else if (host !== undefined) {
 		if (instance !== undefined || project !== undefined || zone !== undefined) {
 			throw new Error("choose either --ssh-host or the three GCP options");
 		}
@@ -118,6 +120,7 @@ export function parseBridgeArguments(args: readonly string[]): BridgeCliCommand 
 }
 
 export function bridgeRunArguments(config: BridgeCliConfig): string[] {
+	if (config.target.kind === "browser") return ["run", "--origin", config.remoteOrigin];
 	return [
 		"run",
 		"--origin",
@@ -230,7 +233,7 @@ export async function resolveBridgeRunConfig(
 	dependencies: Pick<BridgeCliDependencies, "exec">,
 ): Promise<BridgeRunConfig> {
 	const target = config.target;
-	if (target.kind === "ssh") return { remoteOrigin: config.remoteOrigin, target };
+	if (target.kind === "browser" || target.kind === "ssh") return { remoteOrigin: config.remoteOrigin, target };
 	if (target.instance !== "auto") {
 		if (target.zone === undefined) throw new Error("an explicit GCP instance requires --gcp-zone");
 		return { remoteOrigin: config.remoteOrigin, target: { ...target, zone: target.zone } };
@@ -315,7 +318,7 @@ async function runBridge(config: BridgeCliConfig, dependencies: BridgeCliDepende
 	}
 }
 
-const HELP = `Usage: dsh-claude-bridge [run|install] --origin https://example.com --ssh-host SSH_ALIAS\n       dsh-claude-bridge [run|install] --origin https://example.com --gcp-instance INSTANCE --gcp-project PROJECT --gcp-zone ZONE\n       dsh-claude-bridge [run|install] --origin https://example.com --gcp-instance auto --gcp-project PROJECT\n       dsh-claude-bridge uninstall\n\nrun starts the local bridge until Ctrl+C; install starts it now and at macOS login.\nConnect to the same remote machine that runs DSH. Prepare SSH known hosts or GCP authentication first.\nAutomatic GCP discovery selects exactly one devbox owned by the active gcloud account.\nThe bridge does not log in to GCP, change IAM, or store Claude tokens.\n`;
+const HELP = `Usage: dsh-claude-bridge [run|install] --origin https://example.com\n       dsh-claude-bridge [run|install] --origin https://example.com --ssh-host SSH_ALIAS\n       dsh-claude-bridge [run|install] --origin https://example.com --gcp-instance INSTANCE --gcp-project PROJECT --gcp-zone ZONE\n       dsh-claude-bridge [run|install] --origin https://example.com --gcp-instance auto --gcp-project PROJECT\n       dsh-claude-bridge uninstall\n\nThe default browser-return mode needs no SSH or Google Cloud access.\nrun starts the local bridge until Ctrl+C; install starts it now and at macOS login.\nOptional SSH/GCP forwarding must connect to the same remote machine that runs DSH.\nAutomatic GCP discovery selects exactly one devbox owned by the active gcloud account.\nThe bridge does not log in to GCP, change IAM, or store Claude tokens.\n`;
 
 export async function runCallbackBridgeCli(
 	args: readonly string[],

@@ -1,5 +1,7 @@
 import { type ChildProcess } from "node:child_process";
 export type BridgeTarget = {
+    kind: "browser";
+} | {
     kind: "ssh";
     host: string;
 } | {
@@ -20,6 +22,7 @@ export interface CallbackBridgeOptions {
         allowHttpOrigin?: boolean;
         spawnTunnel?: (command: string, args: string[]) => TunnelProcess;
         spawnOwnsProcessGroup?: boolean;
+        beforeBrowserReady?: () => Promise<void>;
         readyTimeoutMs?: number;
         sessionTimeoutMs?: number;
         pollIntervalMs?: number;
