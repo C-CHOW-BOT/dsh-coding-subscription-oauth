@@ -56,7 +56,7 @@ export interface AccountsTabProps {
 	onSignIn: (slug: ProviderSlug, method: LoginMethod, targetAccountId?: string) => void | Promise<void>;
 	onSignOut: (slug: ProviderSlug) => void;
 	onCancelLogin: (slug: ProviderSlug) => void;
-	onSubmitCode: (slug: ProviderSlug) => void;
+	onSubmitCode: (slug: ProviderSlug, code?: string) => void;
 	onCodeChange: (slug: ProviderSlug, value: string) => void;
 	onToggleExpanded: (slug: ProviderSlug) => void;
 	onPreviewSource: (slug: ProviderSlug) => void;
@@ -207,8 +207,8 @@ export function AccountsTab({
 								onCancelLogin={() => {
 									onCancelLogin(definition.slug);
 								}}
-								onSubmitCode={() => {
-									onSubmitCode(definition.slug);
+								onSubmitCode={(code) => {
+									onSubmitCode(definition.slug, code);
 								}}
 								onCodeChange={(value) => {
 									onCodeChange(definition.slug, value);

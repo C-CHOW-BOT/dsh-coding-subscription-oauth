@@ -4,7 +4,7 @@ import { AccountReauthorization } from "./AccountReauthorization.tsx";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { SOURCE_REASON_KEY } from "../constants.ts";
 import { methodLabel, orderedLoginMethods, shouldShowPerCardSourceReason } from "../display.ts";
-import { formatEpoch, looksSecret, modelFields, usageHasVisibleFields } from "../parsers.ts";
+import { formatEpoch, isMatchingClaudeCallback, looksSecret, modelFields, usageHasVisibleFields } from "../parsers.ts";
 import {
 	bodyStyle,
 	buttonStyle,
@@ -59,7 +59,7 @@ export interface ProviderCardProps {
 	onSignIn: (method: LoginMethod, targetAccountId?: string) => void | Promise<void>;
 	onSignOut: () => void;
 	onCancelLogin: () => void;
-	onSubmitCode: () => void;
+	onSubmitCode: (code?: string) => void;
 	onCodeChange: (value: string) => void;
 	onToggleExpanded: () => void;
 	onPreviewSource: () => void;
@@ -75,12 +75,14 @@ function SignInSteps({
 	userCode,
 	url,
 	popupBlocked,
+	manualReturn,
 }: {
 	t: GrokBuildSettingsInjected["t"];
 	activeMethod: LoginMethod;
 	userCode: string | undefined;
 	url: string | undefined;
 	popupBlocked: boolean;
+	manualReturn: boolean;
 }) {
 	const hasCode = userCode !== undefined && userCode.length > 0;
 	const hasUrl = url !== undefined && url.length > 0;
@@ -128,21 +130,23 @@ function SignInSteps({
 					{hasCode ? 3 : 2}
 				</span>
 				<span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-					<span
-						aria-hidden="true"
-						style={{
-							width: 14,
-							height: 14,
-							border: "2px solid var(--dsw-alias-brand-primary, #1677ff)",
-							borderTopColor: "transparent",
-							borderRadius: "50%",
-							animation: "dsh-coding-oauth-spin 0.8s linear infinite",
-						}}
-					/>
-					{t("signInStepWait")}
+					{manualReturn ? null : (
+						<span
+							aria-hidden="true"
+							style={{
+								width: 14,
+								height: 14,
+								border: "2px solid var(--dsw-alias-brand-primary, #1677ff)",
+								borderTopColor: "transparent",
+								borderRadius: "50%",
+								animation: "dsh-coding-oauth-spin 0.8s linear infinite",
+							}}
+						/>
+					)}
+					{t(manualReturn ? "signInStepReturn" : "signInStepWait")}
 				</span>
 			</div>
-			{needsPaste ? (
+			{needsPaste && !manualReturn ? (
 				<div style={{ display: "flex", flexDirection: "column", gap: 8, paddingLeft: 32 }}>
 					<p style={bodyStyle}>{t(activeMethod === "browser" ? "pasteBrowserCodeHint" : "pasteCodeHint")}</p>
 				</div>
@@ -181,6 +185,7 @@ export function ProviderCard({
 	onRetryStatus,
 }: ProviderCardProps) {
 	const [advancedOpen, setAdvancedOpen] = useState(false);
+	const submittedCallback = useRef<string>();
 	const lastConnected = useRef<Extract<ProviderStatus, { status: "signed-in" }>>();
 	if (observed.status === "signed-in") lastConnected.current = observed;
 	if (observed.status === "signed-out") lastConnected.current = undefined;
@@ -200,16 +205,18 @@ export function ProviderCard({
 	const ordered = orderedLoginMethods(definition, remote);
 	const primaryMethod: LoginMethod = ordered[0] ?? definition.recommended;
 	const altMethods = ordered.filter((method) => method !== primaryMethod);
+	const activeMethod = providerStatus.status === "signing-in" ? providerStatus.method : primaryMethod;
+	const remoteClaude = remote && definition.slug === "claude" && activeMethod === "browser";
+	const manualReturn = remoteClaude && providerStatus.status === "signing-in" && Boolean(providerStatus.url);
 
 	const statusLabel =
 		observed.status === "signed-in"
 			? t("signedIn")
 			: observed.status === "signing-in"
-				? t("signingIn")
+				? t(manualReturn ? (busy ? "finishingSignIn" : "waitingForCallbackUrl") : "signingIn")
 				: observed.status === "error"
 					? t("requestFailed")
 					: t("signedOut");
-	const activeMethod = providerStatus.status === "signing-in" ? providerStatus.method : primaryMethod;
 	const { available, selected } = useMemo(() => modelFields(providerStatus), [providerStatus]);
 	const [modelDraft, setModelDraft] = useState<string[]>(selected);
 	const savedMode =
@@ -468,6 +475,11 @@ export function ProviderCard({
 					</details>
 				</div>
 			) : null}
+			{remoteClaude && providerStatus.status !== "signed-in" ? (
+				<p id={`coding-oauth-remote-hint-${definition.slug}`} style={bodyStyle}>
+					{t("remoteClaudeSignInHint")}
+				</p>
+			) : null}
 			{providerStatus.status === "signing-in" ? (
 				<SignInSteps
 					t={t}
@@ -475,20 +487,35 @@ export function ProviderCard({
 					userCode={providerStatus.userCode}
 					url={providerStatus.url}
 					popupBlocked={popupBlocked}
+					manualReturn={manualReturn}
 				/>
 			) : null}
 			{providerStatus.status === "signing-in" && activeMethod !== "device" ? (
 				<div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+					<label
+						htmlFor={`coding-oauth-code-${definition.slug}`}
+						style={manualReturn ? bodyStyle : visuallyHiddenStyle}
+					>
+						{t(manualReturn ? "callbackUrlLabel" : "pasteCodeLabel")}
+					</label>
 					<div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-						<label htmlFor={`coding-oauth-code-${definition.slug}`} style={visuallyHiddenStyle}>
-							{t("pasteCodeLabel")}
-						</label>
 						<input
 							id={`coding-oauth-code-${definition.slug}`}
 							style={{ ...inputStyle, flex: "1 1 360px" }}
 							value={codeInput}
-							placeholder={t("pasteCodePlaceholder")}
+							placeholder={t(manualReturn ? "callbackUrlPlaceholder" : "pasteCodePlaceholder")}
+							aria-describedby={remoteClaude ? `coding-oauth-remote-hint-${definition.slug}` : undefined}
 							disabled={busy}
+							onPaste={(event) => {
+								if (!manualReturn || busy || providerStatus.status !== "signing-in") return;
+								const code = event.clipboardData.getData("text").trim();
+								if (!isMatchingClaudeCallback(code, providerStatus.url)) return;
+								event.preventDefault();
+								onCodeChange(code);
+								if (submittedCallback.current === code) return;
+								submittedCallback.current = code;
+								onSubmitCode(code);
+							}}
 							onChange={(event) => {
 								onCodeChange(event.target.value);
 							}}
@@ -503,9 +530,9 @@ export function ProviderCard({
 							type="button"
 							style={primaryButtonStyle}
 							disabled={busy || codeInput.trim().length === 0}
-							onClick={onSubmitCode}
+							onClick={() => onSubmitCode()}
 						>
-							{t("submitCode")}
+							{t(manualReturn ? (busy ? "finishingSignIn" : "finishSignIn") : "submitCode")}
 						</button>
 					</div>
 				</div>

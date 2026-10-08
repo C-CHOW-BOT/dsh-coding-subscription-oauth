@@ -295,8 +295,8 @@ export function GrokBuildSettings({ t, close, initialTab }: GrokBuildSettingsPro
 		}
 	};
 
-	const submitCode = async (provider: ProviderSlug): Promise<void> => {
-		const code = codeInputs[provider]?.trim() ?? "";
+	const submitCode = async (provider: ProviderSlug, pastedCode?: string): Promise<void> => {
+		const code = (pastedCode ?? codeInputs[provider])?.trim() ?? "";
 		if (code.length === 0) return;
 		setBusyProvider(provider);
 		try {
@@ -739,8 +739,8 @@ export function GrokBuildSettings({ t, close, initialTab }: GrokBuildSettingsPro
 						onCancelLogin={(slug) => {
 							void cancelLogin(slug);
 						}}
-						onSubmitCode={(slug) => {
-							void submitCode(slug);
+						onSubmitCode={(slug, code) => {
+							void submitCode(slug, code);
 						}}
 						onCodeChange={(slug, value) => {
 							setCodeInputs((current) => ({ ...current, [slug]: value }));
