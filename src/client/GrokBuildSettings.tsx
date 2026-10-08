@@ -4,6 +4,7 @@ import { useUnsavedChanges } from "./unsaved.ts";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { cancelPreviewTicket, copyText, isConflictError, isConsumedPreviewError, jsonRequest } from "./api.ts";
+import { claudeBridgeLaunchUrl, navigateClaudeBridge } from "./claude-bridge.ts";
 import { AboutTab } from "./components/AboutTab.tsx";
 import { AccountsTab } from "./components/AccountsTab.tsx";
 import { CapabilitiesTab } from "./components/CapabilitiesTab.tsx";
@@ -89,6 +90,8 @@ export function GrokBuildSettings({ t, close, initialTab }: GrokBuildSettingsPro
 	const [busyProvider, setBusyProvider] = useState<ProviderSlug | undefined>(undefined);
 	const [codeInputs, setCodeInputs] = useState<Partial<Record<ProviderSlug, string>>>({});
 	const [popupBlocked, setPopupBlocked] = useState<Partial<Record<ProviderSlug, boolean>>>({});
+	const [claudeBridgeActive, setClaudeBridgeActive] = useState(false);
+	const bridgePopup = useRef<Window | null>(null);
 	const [sources, setSources] = useState<SourceStatus[] | undefined>(undefined);
 	const [sourcesError, setSourcesError] = useState<string | undefined>(undefined);
 	const [sourcesBusy, setSourcesBusy] = useState(false);
@@ -271,9 +274,20 @@ export function GrokBuildSettings({ t, close, initialTab }: GrokBuildSettingsPro
 		if (gateway !== undefined) setPortDraft(String(gateway.port));
 	}, [gateway]);
 
-	const signIn = async (provider: ProviderSlug, method: LoginMethod, targetAccountId?: string): Promise<void> => {
-		const popup = window.open("about:blank", "_blank");
-		if (popup !== null) popup.opener = null;
+	const signIn = async (
+		provider: ProviderSlug,
+		method: LoginMethod,
+		targetAccountId?: string,
+		useBridge = false,
+	): Promise<void> => {
+		const popupName = useBridge ? `dsh-claude-bridge-${globalThis.crypto.randomUUID()}` : "_blank";
+		const popup = window.open("about:blank", popupName);
+		if (popup !== null && !useBridge) popup.opener = null;
+		if (provider === "claude") {
+			bridgePopup.current?.close();
+			bridgePopup.current = useBridge ? popup : null;
+			setClaudeBridgeActive(false);
+		}
 		setBusyProvider(provider);
 		setRequestError(undefined);
 		setPopupBlocked((current) => ({ ...current, [provider]: popup === null }));
@@ -284,7 +298,12 @@ export function GrokBuildSettings({ t, close, initialTab }: GrokBuildSettingsPro
 				accountMode: targetAccountId === undefined ? "add" : "reauthorize",
 				...(targetAccountId === undefined ? {} : { targetAccountId, confirmOverwrite: true }),
 			});
-			if (popup !== null) popup.location.replace(challenge.url);
+			const destination = useBridge ? claudeBridgeLaunchUrl(challenge.url, window.location.origin) : challenge.url;
+			if (provider === "claude") setClaudeBridgeActive(useBridge);
+			if (popup !== null) {
+				if (useBridge) navigateClaudeBridge(popup, popupName, destination);
+				else popup.location.replace(destination);
+			}
 			await refresh();
 		} catch (error: unknown) {
 			popup?.close();
@@ -311,6 +330,11 @@ export function GrokBuildSettings({ t, close, initialTab }: GrokBuildSettingsPro
 	};
 
 	const cancelLogin = async (provider: ProviderSlug): Promise<void> => {
+		if (provider === "claude") {
+			bridgePopup.current?.close();
+			bridgePopup.current = null;
+			setClaudeBridgeActive(false);
+		}
 		setBusyProvider(provider);
 		try {
 			setStatus(await jsonRequest<CodingOAuthStatus>(LOGIN_CANCEL_PATH, "POST", { provider }));
@@ -733,6 +757,13 @@ export function GrokBuildSettings({ t, close, initialTab }: GrokBuildSettingsPro
 						usageError={usageError}
 						usageLoading={usageLoading}
 						onSignIn={(slug, method, targetAccountId) => signIn(slug, method, targetAccountId)}
+						onClaudeBridgeSignIn={() => void signIn("claude", "browser", undefined, true)}
+						claudeBridgeActive={claudeBridgeActive}
+						onUseManualClaudeCallback={() => {
+							bridgePopup.current?.close();
+							bridgePopup.current = null;
+							setClaudeBridgeActive(false);
+						}}
 						onSignOut={(slug) => {
 							void signOut(slug);
 						}}

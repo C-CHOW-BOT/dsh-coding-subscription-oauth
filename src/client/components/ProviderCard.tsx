@@ -2,6 +2,7 @@ import { AccountReauthorization } from "./AccountReauthorization.tsx";
 /** Single provider account card for the Accounts tab. */
 
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { claudeBridgeLaunchUrl } from "../claude-bridge.ts";
 import { SOURCE_REASON_KEY } from "../constants.ts";
 import { methodLabel, orderedLoginMethods, shouldShowPerCardSourceReason } from "../display.ts";
 import { formatEpoch, isMatchingClaudeCallback, looksSecret, modelFields, usageHasVisibleFields } from "../parsers.ts";
@@ -57,6 +58,9 @@ export interface ProviderCardProps {
 	usageError: string | undefined;
 	usageLoading: boolean;
 	onSignIn: (method: LoginMethod, targetAccountId?: string) => void | Promise<void>;
+	onBridgeSignIn?: (() => void) | undefined;
+	bridgeActive?: boolean | undefined;
+	onUseManualCallback?: (() => void) | undefined;
 	onSignOut: () => void;
 	onCancelLogin: () => void;
 	onSubmitCode: (code?: string) => void;
@@ -76,6 +80,7 @@ function SignInSteps({
 	url,
 	popupBlocked,
 	manualReturn,
+	bridgeActive,
 }: {
 	t: GrokBuildSettingsInjected["t"];
 	activeMethod: LoginMethod;
@@ -83,6 +88,7 @@ function SignInSteps({
 	url: string | undefined;
 	popupBlocked: boolean;
 	manualReturn: boolean;
+	bridgeActive: boolean;
 }) {
 	const hasCode = userCode !== undefined && userCode.length > 0;
 	const hasUrl = url !== undefined && url.length > 0;
@@ -94,14 +100,22 @@ function SignInSteps({
 				<span style={hasUrl ? stepNumberActiveStyle : stepNumberStyle} aria-hidden="true">
 					1
 				</span>
-				<span>{t("signInStepOpen")}</span>
+				<span>{t(bridgeActive ? "bridgeSignInStepOpen" : "signInStepOpen")}</span>
 			</div>
 			{hasUrl ? (
 				<div style={{ display: "flex", flexWrap: "wrap", gap: 8, paddingLeft: 32 }}>
-					<a href={url} target="_blank" rel="noreferrer" style={primaryButtonStyle}>
-						{t("openAuthUrl")}
+					<a
+						href={bridgeActive ? claudeBridgeLaunchUrl(url!, window.location.origin) : url}
+						target="_blank"
+						rel={bridgeActive ? "noopener" : "noreferrer"}
+						referrerPolicy={bridgeActive ? "origin" : undefined}
+						style={primaryButtonStyle}
+					>
+						{t(bridgeActive ? "openBridge" : "openAuthUrl")}
 					</a>
-					<CopyButton text={url} idleLabel={t("copy")} copiedLabel={t("copied")} failedLabel={t("copyFailed")} />
+					{bridgeActive ? null : (
+						<CopyButton text={url} idleLabel={t("copy")} copiedLabel={t("copied")} failedLabel={t("copyFailed")} />
+					)}
 				</div>
 			) : null}
 			{popupBlocked && hasUrl ? <p style={hintStyle}>{t("popupBlocked")}</p> : null}
@@ -146,7 +160,7 @@ function SignInSteps({
 					{t(manualReturn ? "signInStepReturn" : "signInStepWait")}
 				</span>
 			</div>
-			{needsPaste && !manualReturn ? (
+			{needsPaste && !manualReturn && !bridgeActive ? (
 				<div style={{ display: "flex", flexDirection: "column", gap: 8, paddingLeft: 32 }}>
 					<p style={bodyStyle}>{t(activeMethod === "browser" ? "pasteBrowserCodeHint" : "pasteCodeHint")}</p>
 				</div>
@@ -173,6 +187,9 @@ export function ProviderCard({
 	usageError,
 	usageLoading,
 	onSignIn,
+	onBridgeSignIn,
+	bridgeActive = false,
+	onUseManualCallback,
 	onSignOut,
 	onCancelLogin,
 	onSubmitCode,
@@ -207,7 +224,9 @@ export function ProviderCard({
 	const altMethods = ordered.filter((method) => method !== primaryMethod);
 	const activeMethod = providerStatus.status === "signing-in" ? providerStatus.method : primaryMethod;
 	const remoteClaude = remote && definition.slug === "claude" && activeMethod === "browser";
-	const manualReturn = remoteClaude && providerStatus.status === "signing-in" && Boolean(providerStatus.url);
+	const usingBridge = remoteClaude && bridgeActive;
+	const manualReturn =
+		remoteClaude && !usingBridge && providerStatus.status === "signing-in" && Boolean(providerStatus.url);
 
 	const statusLabel =
 		observed.status === "signed-in"
@@ -408,11 +427,21 @@ export function ProviderCard({
 							style={primaryButtonStyle}
 							disabled={busy}
 							onClick={() => {
-								onSignIn(primaryMethod);
+								if (remoteClaude && onBridgeSignIn !== undefined) onBridgeSignIn();
+								else onSignIn(primaryMethod);
 							}}
 						>
-							{busy ? t("working") : methodLabel(primaryMethod, t, { remote, primary: true })}
+							{busy
+								? t("working")
+								: remoteClaude && onBridgeSignIn !== undefined
+									? t("bridgeSignIn")
+									: methodLabel(primaryMethod, t, { remote, primary: true })}
 						</button>
+						{remoteClaude && onBridgeSignIn !== undefined ? (
+							<button type="button" style={buttonStyle} disabled={busy} onClick={() => onSignIn("browser")}>
+								{t("manualClaudeSignIn")}
+							</button>
+						) : null}
 						{altMethods.length > 0 ? (
 							<button
 								type="button"
@@ -475,7 +504,30 @@ export function ProviderCard({
 					</details>
 				</div>
 			) : null}
-			{remoteClaude && providerStatus.status !== "signed-in" ? (
+			{remoteClaude && onBridgeSignIn !== undefined && providerStatus.status === "signed-out" ? (
+				<p style={bodyStyle}>
+					{t("bridgeSetupHint")}{" "}
+					<a
+						href="https://github.com/lninghaha/dsh-coding-subscription-oauth/blob/main/docs/remote-claude-bridge.md"
+						target="_blank"
+						rel="noreferrer"
+					>
+						{t("bridgeSetupLink")}
+					</a>
+				</p>
+			) : null}
+			{usingBridge && providerStatus.status === "signing-in" ? (
+				<>
+					<p style={bodyStyle}>{t("bridgeWaitingHint")}</p>
+					<button type="button" style={buttonStyle} disabled={busy} onClick={onUseManualCallback}>
+						{t("manualClaudeSignIn")}
+					</button>
+				</>
+			) : null}
+			{remoteClaude &&
+			!usingBridge &&
+			providerStatus.status !== "signed-in" &&
+			(onBridgeSignIn === undefined || providerStatus.status === "signing-in") ? (
 				<p id={`coding-oauth-remote-hint-${definition.slug}`} style={bodyStyle}>
 					{t("remoteClaudeSignInHint")}
 				</p>
@@ -488,9 +540,10 @@ export function ProviderCard({
 					url={providerStatus.url}
 					popupBlocked={popupBlocked}
 					manualReturn={manualReturn}
+					bridgeActive={usingBridge}
 				/>
 			) : null}
-			{providerStatus.status === "signing-in" && activeMethod !== "device" ? (
+			{providerStatus.status === "signing-in" && activeMethod !== "device" && !usingBridge ? (
 				<div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
 					<label
 						htmlFor={`coding-oauth-code-${definition.slug}`}

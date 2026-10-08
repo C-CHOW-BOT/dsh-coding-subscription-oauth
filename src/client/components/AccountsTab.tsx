@@ -54,6 +54,9 @@ export interface AccountsTabProps {
 	usageError: string | undefined;
 	usageLoading: boolean;
 	onSignIn: (slug: ProviderSlug, method: LoginMethod, targetAccountId?: string) => void | Promise<void>;
+	onClaudeBridgeSignIn?: (() => void) | undefined;
+	claudeBridgeActive?: boolean | undefined;
+	onUseManualClaudeCallback?: (() => void) | undefined;
 	onSignOut: (slug: ProviderSlug) => void;
 	onCancelLogin: (slug: ProviderSlug) => void;
 	onSubmitCode: (slug: ProviderSlug, code?: string) => void;
@@ -99,6 +102,9 @@ export function AccountsTab({
 	usageError,
 	usageLoading,
 	onSignIn,
+	onClaudeBridgeSignIn,
+	claudeBridgeActive,
+	onUseManualClaudeCallback,
 	onSignOut,
 	onCancelLogin,
 	onSubmitCode,
@@ -201,6 +207,9 @@ export function AccountsTab({
 								usageError={usageError}
 								usageLoading={usageLoading}
 								onSignIn={(method, targetAccountId) => onSignIn(definition.slug, method, targetAccountId)}
+								onBridgeSignIn={definition.slug === "claude" ? onClaudeBridgeSignIn : undefined}
+								bridgeActive={definition.slug === "claude" && claudeBridgeActive === true}
+								onUseManualCallback={definition.slug === "claude" ? onUseManualClaudeCallback : undefined}
 								onSignOut={() => {
 									onSignOut(definition.slug);
 								}}

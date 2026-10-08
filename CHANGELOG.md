@@ -8,6 +8,10 @@ All notable changes to `dsh-coding-subscription-oauth` are documented here, foll
 
 - Explain the localhost error page before remote Claude authorization and automatically finish sign-in when a pasted full callback URL matches the pending authorization state and redirect address. Keep manual submission available for other input formats.
 
+### Added
+
+- Optional local Claude callback bridge with SSH/IAP transport, connection readiness checks before authorization, automatic callback forwarding, and a per-user macOS startup installer. Remote Accounts settings offer automatic sign-in with callback paste as a fallback.
+
 ## v0.8.5 - 2026-09-15
 
 ### Fixed
