@@ -13,7 +13,9 @@ const RETURN_KEY = "dsh-claude-callback";
 const RETURN_DEADLINE_MS = 60_000;
 const RETURN_POLL_ATTEMPTS = 120;
 
-class ClaudeBridgeReturnTimeoutError extends Error {
+class ClaudeBridgeReturnUnconfirmedError extends Error {}
+
+class ClaudeBridgeReturnTimeoutError extends ClaudeBridgeReturnUnconfirmedError {
 	constructor() {
 		super("Sign-in confirmation timed out.");
 	}
@@ -80,6 +82,11 @@ export async function finishClaudeBridgeReturn(
 		} catch (error) {
 			await retryStatusError(error);
 		}
+	}
+	if (pending.status === "signed-in" && !pending.operationError) {
+		// Another page may have completed sign-in before this page observed the
+		// attempt. A current account alone cannot identify this callback's receipt.
+		throw new ClaudeBridgeReturnUnconfirmedError("This return cannot be linked to a completed sign-in.");
 	}
 	const attemptId = pending.loginAttemptId;
 	if (
@@ -250,8 +257,8 @@ export function mountClaudeBridgeReturn(callback: string, t: GrokBuildSettingsIn
 			(error: unknown) => {
 				if (!disposed)
 					render(
-						error instanceof ClaudeBridgeReturnTimeoutError ||
-							controller.signal.reason instanceof ClaudeBridgeReturnTimeoutError
+						error instanceof ClaudeBridgeReturnUnconfirmedError ||
+							controller.signal.reason instanceof ClaudeBridgeReturnUnconfirmedError
 							? "unconfirmed"
 							: "failure",
 					);

@@ -12,6 +12,7 @@ All notable changes to `dsh-coding-subscription-oauth` are documented here, foll
 - Preserve an already registered macOS service without an owned installation file. Recover confirmation after slow authorization or a lost response without resubmitting the callback, distinguish an unconfirmed observation timeout from failure, and keep keyboard focus inside the callback return dialog.
 - Reject new subscription sign-in while sign-out is completing or the plugin is disposed, so an older logout cannot erase a newer credential and an in-flight request cannot restart authorization after teardown. Concurrent sign-out requests share the same operation.
 - Reject retries while a canceled authorization is still draining, wait for owned logout during plugin disposal, and reject stale logout requests after teardown. Recover automatic return after transient initial status failure or an ambiguous callback acknowledgement, including manual submission winning the race, using only the original attempt's completion receipt.
+- Report an unconfirmed result instead of a failed login when the first successful return-page status read finds an already signed-in account without a pending challenge. Do not submit again or infer that an unbound completion receipt belongs to the callback.
 
 ### Added
 

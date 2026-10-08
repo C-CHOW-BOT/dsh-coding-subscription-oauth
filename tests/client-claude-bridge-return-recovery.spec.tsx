@@ -47,6 +47,7 @@ async function fixture(
 	} as unknown as Context;
 	let authenticated = false;
 	let finish = () => {};
+	let fail = () => {};
 	let generation = 0;
 	let codeAccepted = false;
 	const sessions = OAUTH_PROVIDER_DEFINITIONS.map((definition) => ({
@@ -70,6 +71,10 @@ async function fixture(
 					interaction.signal?.removeEventListener("abort", abort);
 					authenticated = true;
 					resolve();
+				};
+				fail = () => {
+					interaction.signal?.removeEventListener("abort", abort);
+					reject(new Error("fixture exchange failed"));
 				};
 				interaction.signal?.addEventListener("abort", abort, { once: true });
 				if (interaction.signal?.aborted) abort();
@@ -179,11 +184,141 @@ async function fixture(
 		releaseCode,
 		accepted: () => codeAccepted,
 		finish: () => finish(),
+		fail: () => fail(),
 		reads: () => reads,
 		posts: () => posts,
 		close,
 	};
 }
+
+it.each([false, true])(
+	"leaves an account completed before the first return observation unconfirmed (stale callback=%s)",
+	async (stale) => {
+		const f = await fixture();
+		let dispose: (() => void) | undefined;
+		try {
+			const pending = (await f.api.jsonRequest<CodingOAuthStatus>(STATUS_PATH)).providers.claude;
+			await f.api.jsonRequest(LOGIN_CODE_PATH, "POST", {
+				provider: "claude",
+				code: callback,
+				loginAttemptId: pending.loginAttemptId,
+			});
+			await waitFor(() => expect(f.accepted()).toBe(true));
+			f.finish();
+			await waitFor(async () =>
+				expect((await f.api.jsonRequest<CodingOAuthStatus>(STATUS_PATH)).providers.claude).toMatchObject({
+					status: "signed-in",
+					completedLoginAttemptId: pending.loginAttemptId,
+				}),
+			);
+			await act(async () => {
+				dispose = f.consumer.mountClaudeBridgeReturn(
+					stale ? callback.replace("fixture-state", "unrelated-state") : callback,
+					(key) => en[key],
+				);
+			});
+			await waitFor(() => expect(document.body.textContent).toContain(en.bridgeReturnUnconfirmed));
+			expect((await f.api.jsonRequest<CodingOAuthStatus>(STATUS_PATH)).providers.claude).toMatchObject({
+				status: "signed-in",
+				completedLoginAttemptId: pending.loginAttemptId,
+			});
+			expect(document.body.textContent).not.toContain(en.bridgeReturnFailure);
+			expect(document.body.textContent).not.toContain(en.bridgeReturnSuccess);
+			expect(f.posts()).toBe(1);
+		} finally {
+			await act(async () => dispose?.());
+			await f.close();
+		}
+	},
+);
+
+it("leaves manual completion during initial readiness recovery unconfirmed without another callback POST", async () => {
+	const options: Parameters<typeof fixture>[0] = {};
+	const f = await fixture(options);
+	let dispose: (() => void) | undefined;
+	try {
+		const pending = (await f.api.jsonRequest<CodingOAuthStatus>(STATUS_PATH)).providers.claude;
+		options.statusFailureAlways = 503;
+		await act(async () => {
+			dispose = f.consumer.mountClaudeBridgeReturn(callback, (key) => en[key]);
+		});
+		await waitFor(() => expect(f.reads()).toBe(2));
+		await f.api.jsonRequest(LOGIN_CODE_PATH, "POST", {
+			provider: "claude",
+			code: callback,
+			loginAttemptId: pending.loginAttemptId,
+		});
+		await waitFor(() => expect(f.accepted()).toBe(true));
+		f.finish();
+		delete options.statusFailureAlways;
+		await waitFor(() => expect(document.body.textContent).toContain(en.bridgeReturnUnconfirmed));
+		expect((await f.api.jsonRequest<CodingOAuthStatus>(STATUS_PATH)).providers.claude).toMatchObject({
+			status: "signed-in",
+			completedLoginAttemptId: pending.loginAttemptId,
+		});
+		expect(document.body.textContent).not.toContain(en.bridgeReturnFailure);
+		expect(document.body.textContent).not.toContain(en.bridgeReturnSuccess);
+		expect(f.posts()).toBe(1);
+	} finally {
+		await act(async () => dispose?.());
+		await f.close();
+	}
+});
+
+it.each([false, true])(
+	"does not infer completion from an older account after a later attempt ends (operationError=%s)",
+	async (operationError) => {
+		const f = await fixture();
+		let dispose: (() => void) | undefined;
+		try {
+			const first = (await f.api.jsonRequest<CodingOAuthStatus>(STATUS_PATH)).providers.claude;
+			await f.api.jsonRequest(LOGIN_CODE_PATH, "POST", {
+				provider: "claude",
+				code: callback,
+				loginAttemptId: first.loginAttemptId,
+			});
+			await waitFor(() => expect(f.accepted()).toBe(true));
+			f.finish();
+			await waitFor(async () =>
+				expect((await f.api.jsonRequest<CodingOAuthStatus>(STATUS_PATH)).providers.claude.status).toBe("signed-in"),
+			);
+			await f.api.jsonRequest(LOGIN_PATH, "POST", { provider: "claude", method: "browser" });
+			const second = (await f.api.jsonRequest<CodingOAuthStatus>(STATUS_PATH)).providers.claude;
+			const returned = callback.replace("fixture-state", "fixture-state-2");
+			if (operationError) {
+				await f.api.jsonRequest(LOGIN_CODE_PATH, "POST", {
+					provider: "claude",
+					code: returned,
+					loginAttemptId: second.loginAttemptId,
+				});
+				await waitFor(() => expect(f.accepted()).toBe(true));
+				f.fail();
+				await waitFor(async () =>
+					expect((await f.api.jsonRequest<CodingOAuthStatus>(STATUS_PATH)).providers.claude.operationError).toBe(
+						"fixture exchange failed",
+					),
+				);
+			} else await f.api.jsonRequest(LOGIN_CANCEL_PATH, "POST", { provider: "claude" });
+			const stored = (await f.api.jsonRequest<CodingOAuthStatus>(STATUS_PATH)).providers.claude;
+			expect(stored.status).toBe("signed-in");
+			expect(stored.completedLoginAttemptId).toBeUndefined();
+			const posts = f.posts();
+			await act(async () => {
+				dispose = f.consumer.mountClaudeBridgeReturn(returned, (key) => en[key]);
+			});
+			await waitFor(() =>
+				expect(document.body.textContent).toContain(
+					operationError ? en.bridgeReturnFailure : en.bridgeReturnUnconfirmed,
+				),
+			);
+			expect(document.body.textContent).not.toContain(en.bridgeReturnSuccess);
+			expect(f.posts()).toBe(posts);
+		} finally {
+			await act(async () => dispose?.());
+			await f.close();
+		}
+	},
+);
 
 it.each(["transport", 503] as const)(
 	"recovers one transient initial %s status failure before the sole callback POST",
