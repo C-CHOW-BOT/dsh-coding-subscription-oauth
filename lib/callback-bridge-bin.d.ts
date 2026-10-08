@@ -43,7 +43,7 @@ export interface BridgeCliDependencies {
     secureAgent(path: string): Promise<void>;
     removeAgent(path: string): Promise<void>;
     launchctl(args: string[]): Promise<number>;
-    exec(command: string, args: string[]): Promise<string>;
+    exec(command: string, args: string[], signal?: AbortSignal): Promise<string>;
     probeHealth(timeoutMs: number): Promise<unknown>;
     wait(milliseconds: number): Promise<void>;
     now(): number;
@@ -54,7 +54,7 @@ export declare function parseBridgeArguments(args: readonly string[]): BridgeCli
 export declare function bridgeRunArguments(config: BridgeCliConfig): string[];
 export declare function bridgeLaunchAgentPlist(config: BridgeCliConfig, nodeExecutable: string, binPath: string, executableSearchPath: string): string;
 /** Discover one account-owned devbox without switching accounts or exposing instance metadata. */
-export declare function resolveBridgeRunConfig(config: BridgeCliConfig, dependencies: Pick<BridgeCliDependencies, "exec">): Promise<BridgeRunConfig>;
+export declare function resolveBridgeRunConfig(config: BridgeCliConfig, dependencies: Pick<BridgeCliDependencies, "exec">, signal?: AbortSignal): Promise<BridgeRunConfig>;
 export declare function runCallbackBridgeCli(args: readonly string[], dependencies: BridgeCliDependencies): Promise<number>;
 export declare function defaultBridgeCliDependencies(): BridgeCliDependencies;
 //# sourceMappingURL=callback-bridge-bin.d.ts.map

@@ -1,3 +1,6 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
 	BRIDGE_LAUNCH_AGENT_LABEL,
@@ -5,6 +8,7 @@ import {
 	type BridgeCliDependencies,
 	bridgeConfigurationId,
 	bridgeLaunchAgentPlist,
+	defaultBridgeCliDependencies,
 	parseBridgeArguments,
 	resolveBridgeRunConfig,
 	runCallbackBridgeCli,
@@ -181,6 +185,45 @@ describe("callback bridge process lifecycle", () => {
 		ready?.({ url: "http://127.0.0.1:53700/start", close });
 		expect(await running).toBe(0);
 		expect(close).toHaveBeenCalledTimes(1);
+	});
+
+	it("returns promptly when startup ignores cancellation and closes its late bridge without claiming readiness", async () => {
+		const { dependencies, signals, close } = fixture();
+		let ready: ((value: { url: string; close(): Promise<void> }) => void) | undefined;
+		dependencies.start = vi.fn(
+			() =>
+				new Promise<{ url: string; close(): Promise<void> }>((resolve) => {
+					ready = resolve;
+				}),
+		);
+		const running = runCallbackBridgeCli(SSH_ARGS, dependencies);
+		await vi.waitFor(() => expect(dependencies.start).toHaveBeenCalled());
+		signals.get("SIGTERM")?.();
+		expect(await running).toBe(0);
+		expect(dependencies.stdout).not.toHaveBeenCalled();
+		expect(signals.size).toBe(0);
+		expect(close).not.toHaveBeenCalled();
+		ready?.({ url: "http://127.0.0.1:53700/start", close });
+		await vi.waitFor(() => expect(close).toHaveBeenCalledTimes(1));
+	});
+
+	it("observes a canceled startup rejection without exposing it or claiming readiness", async () => {
+		const { dependencies, signals } = fixture();
+		let rejectStartup: ((reason: Error) => void) | undefined;
+		dependencies.start = vi.fn(
+			() =>
+				new Promise<{ url: string; close(): Promise<void> }>((_resolve, reject) => {
+					rejectStartup = reject;
+				}),
+		);
+		const running = runCallbackBridgeCli(SSH_ARGS, dependencies);
+		await vi.waitFor(() => expect(dependencies.start).toHaveBeenCalled());
+		signals.get("SIGINT")?.();
+		expect(await running).toBe(0);
+		rejectStartup?.(new Error("private-startup-response"));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(dependencies.stderr).not.toHaveBeenCalled();
+		expect(dependencies.stdout).not.toHaveBeenCalled();
 	});
 
 	it("reports startup failure and cleans up signal handlers", async () => {
@@ -514,6 +557,61 @@ describe("automatic GCP devbox discovery", () => {
 		expect(dependencies.stderr).not.toHaveBeenCalled();
 	});
 
+	it.each(["account", "inventory"] as const)(
+		"cancels deferred %s discovery promptly even when the dependency ignores abort",
+		async (phase) => {
+			const { dependencies, signals } = fixture(auto);
+			let release: ((value: string) => void) | undefined;
+			dependencies.exec = vi.fn(async (_command, args) => {
+				if (phase === "account" || args[0] === "compute") {
+					return new Promise<string>((resolve) => {
+						release = resolve;
+					});
+				}
+				return "user@example.com";
+			});
+			const running = runCallbackBridgeCli(
+				["run", "--origin", "https://example.com", "--gcp-instance", "auto", "--gcp-project", "example-project"],
+				dependencies,
+			);
+			await vi.waitFor(() => expect(dependencies.exec).toHaveBeenCalledTimes(phase === "account" ? 1 : 2));
+			const signal = vi.mocked(dependencies.exec).mock.calls[0]?.[2];
+			expect(signal).toBeInstanceOf(AbortSignal);
+			signals.get("SIGTERM")?.();
+			expect(await running).toBe(0);
+			expect(signal?.aborted).toBe(true);
+			expect(signals.size).toBe(0);
+			release?.(phase === "account" ? "user@example.com" : JSON.stringify([instance("owned-vm", "user@example.com")]));
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(dependencies.exec).toHaveBeenCalledTimes(phase === "account" ? 1 : 2);
+			expect(dependencies.start).not.toHaveBeenCalled();
+			expect(dependencies.stdout).not.toHaveBeenCalled();
+			expect(dependencies.stderr).not.toHaveBeenCalled();
+		},
+	);
+
+	it("observes an ignored-abort discovery rejection after cancellation", async () => {
+		const { dependencies, signals } = fixture(auto);
+		let rejectDiscovery: ((reason: Error) => void) | undefined;
+		dependencies.exec = vi.fn(
+			() =>
+				new Promise<string>((_resolve, reject) => {
+					rejectDiscovery = reject;
+				}),
+		);
+		const running = runCallbackBridgeCli(
+			["run", "--origin", "https://example.com", "--gcp-instance", "auto", "--gcp-project", "example-project"],
+			dependencies,
+		);
+		await vi.waitFor(() => expect(dependencies.exec).toHaveBeenCalled());
+		signals.get("SIGINT")?.();
+		expect(await running).toBe(0);
+		rejectDiscovery?.(new Error("private-discovery-response"));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(dependencies.start).not.toHaveBeenCalled();
+		expect(dependencies.stderr).not.toHaveBeenCalled();
+	});
+
 	it.each([
 		{ inventory: [] },
 		{ inventory: [instance("other-vm", "other@example.com")] },
@@ -606,5 +704,57 @@ describe("automatic GCP devbox discovery", () => {
 		expect(bridgeConfigurationId(auto)).not.toBe(bridgeConfigurationId(resolved));
 		signals.get("SIGTERM")?.();
 		expect(await running).toBe(0);
+	});
+});
+
+describe("owned discovery subprocess cancellation", () => {
+	it("rejects an already aborted discovery before spawning a command", async () => {
+		const dependencies = defaultBridgeCliDependencies();
+		const cancellation = new AbortController();
+		cancellation.abort();
+		await expect(dependencies.exec("unused-command", [], cancellation.signal)).rejects.toThrow("cancelled");
+	});
+
+	it("terminates only its own stubborn discovery subprocess within the cleanup bound", async () => {
+		const dependencies = defaultBridgeCliDependencies();
+		const directory = await mkdtemp(join(tmpdir(), "dsh-bridge-cancel-"));
+		const marker = join(directory, "pid");
+		const cancellation = new AbortController();
+		let pid: number | undefined;
+		try {
+			const execution = dependencies.exec(
+				process.execPath,
+				[
+					"--input-type=module",
+					"-e",
+					"import {writeFileSync} from 'node:fs'; process.on('SIGTERM',()=>{}); writeFileSync(process.argv[1],String(process.pid)); setInterval(()=>{},1000);",
+					marker,
+				],
+				cancellation.signal,
+			);
+			const rejected = expect(execution).rejects.toThrow("cancelled");
+			await vi.waitFor(async () => {
+				pid = Number(await readFile(marker, "utf8"));
+				expect(pid).toBeGreaterThan(0);
+			});
+			cancellation.abort();
+			await rejected;
+			await vi.waitFor(
+				() => {
+					expect(() => process.kill(pid!, 0)).toThrow();
+				},
+				{ timeout: 2_000 },
+			);
+		} finally {
+			cancellation.abort();
+			if (pid !== undefined) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {
+					// The owned fixture process was already terminated.
+				}
+			}
+			await rm(directory, { recursive: true, force: true });
+		}
 	});
 });

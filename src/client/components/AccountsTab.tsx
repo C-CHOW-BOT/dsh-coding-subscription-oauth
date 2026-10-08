@@ -54,7 +54,7 @@ export interface AccountsTabProps {
 	usageError: string | undefined;
 	usageLoading: boolean;
 	onSignIn: (slug: ProviderSlug, method: LoginMethod, targetAccountId?: string) => void | Promise<void>;
-	onClaudeBridgeSignIn?: (() => void) | undefined;
+	onClaudeBridgeSignIn?: ((targetAccountId?: string) => void | Promise<void>) | undefined;
 	claudeBridgeActive?: boolean | undefined;
 	onUseManualClaudeCallback?: (() => void) | undefined;
 	onSignOut: (slug: ProviderSlug) => void;

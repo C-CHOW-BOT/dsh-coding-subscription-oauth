@@ -5,7 +5,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { claudeBridgeLaunchUrl } from "../src/client/claude-bridge.ts";
 import { GrokBuildSettings } from "../src/client/GrokBuildSettings.tsx";
 import { ProviderCard } from "../src/client/components/ProviderCard.tsx";
-import { LOGIN_PATH, PROVIDERS, STATUS_PATH } from "../src/client/constants.ts";
+import { LOGIN_CODE_PATH, LOGIN_PATH, PROVIDERS, STATUS_PATH } from "../src/client/constants.ts";
 import { en } from "../src/client/locales.ts";
 
 const mocks = vi.hoisted(() => ({ request: vi.fn() }));
@@ -93,4 +93,70 @@ it("opens the local bridge rather than Claude directly after the login challenge
 	expect(screen.getByText(en.bridgeWaitingHint)).toBeTruthy();
 	signedIn = true;
 	await waitFor(() => expect(screen.queryByText(en.bridgeWaitingHint)).toBeNull(), { timeout: 2000 });
+});
+
+it("uses the bridge for confirmed reauthorization of the selected remote Claude account", async () => {
+	let signingIn = false;
+	const popup = { opener: undefined, location: { replace: vi.fn() }, close: vi.fn() };
+	vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+	const navigations: HTMLAnchorElement[] = [];
+	vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+		navigations.push(this);
+	});
+	mocks.request.mockReset();
+	mocks.request.mockImplementation(async (path: string) => {
+		if (path === LOGIN_PATH) { signingIn = true; return { url: authUrl }; }
+		if (path === STATUS_PATH) return {
+			uiOwner: "standalone", accessMode: "trusted-https-proxy",
+			antigravity: { installed: false, route: "agy" }, opencodeGo: { active: false, lastCall: "no-call", updatedAt: null },
+			compatibility: { coreAbi: "dsh-coding-oauth-core/v1", dshVersion: "0.1.1-rc.2", status: "healthy", diagnostics: [] },
+			providers: {
+				grok: { status: "signed-out", grokImportAvailable: false }, codex: { status: "signed-out" }, kimi: { status: "signed-out" },
+				claude: { provider: "claude", route: "claude-code-oauth", displayName: "Claude", loginMethods: ["browser"], recommendedLoginMethod: "browser", models: [], available: [], selected: [],
+					...(signingIn ? { status: "signing-in", method: "browser", url: authUrl }
+						: { status: "signed-in", accounts: [{ id: "selected-account", expires: 2_000_000_000_000 }], activeAccountId: "selected-account" }),
+				},
+			},
+		};
+		return { sources: [] };
+	});
+	render(createElement(GrokBuildSettings, { t: (key) => en[key] }));
+	fireEvent.click(await screen.findByRole("button", { name: en.expandModels }));
+	fireEvent.click(screen.getByRole("button", { name: en.accountReauthorize }));
+	expect(mocks.request.mock.calls.filter(([path]) => path === LOGIN_PATH)).toHaveLength(0);
+	fireEvent.click(screen.getByRole("button", { name: `${en.accountReauthorize} · ${en.browserLogin}` }));
+	await waitFor(() => expect(navigations).toHaveLength(1));
+	expect(navigations[0]!.href).toBe(claudeBridgeLaunchUrl(authUrl, window.location.origin));
+	expect(popup.location.replace).not.toHaveBeenCalled();
+	expect(mocks.request).toHaveBeenCalledWith(LOGIN_PATH, "POST", {
+		provider: "claude", method: "browser", accountMode: "reauthorize", targetAccountId: "selected-account", confirmOverwrite: true,
+	});
+	await screen.findByText(en.bridgeWaitingHint);
+});
+
+it("binds a pasted callback to the pending Claude attempt shown in Settings", async () => {
+	const callback = "http://localhost:53692/callback?code=fixture-code&state=pending-state";
+	mocks.request.mockReset();
+	mocks.request.mockImplementation(async (path: string) => {
+		if (path === LOGIN_CODE_PATH) return { ok: true };
+		if (path === STATUS_PATH) return {
+			uiOwner: "standalone", accessMode: "trusted-https-proxy",
+			antigravity: { installed: false, route: "agy" }, opencodeGo: { active: false, lastCall: "no-call", updatedAt: null },
+			compatibility: { coreAbi: "dsh-coding-oauth-core/v1", dshVersion: "0.1.1-rc.2", status: "healthy", diagnostics: [] },
+			providers: {
+				grok: { status: "signed-out", grokImportAvailable: false }, codex: { status: "signed-out" }, kimi: { status: "signed-out" },
+				claude: { provider: "claude", route: "claude-code-oauth", displayName: "Claude", loginMethods: ["browser"], recommendedLoginMethod: "browser", models: [], available: [], selected: [],
+					status: "signing-in", method: "browser", url: authUrl, loginAttemptId: "displayed-attempt",
+				},
+			},
+		};
+		return { sources: [] };
+	});
+	render(createElement(GrokBuildSettings, { t: (key) => en[key] }));
+	const input = await screen.findByRole("textbox", { name: en.callbackUrlLabel });
+	fireEvent.paste(input, { clipboardData: { getData: () => callback } });
+	await waitFor(() => expect(mocks.request).toHaveBeenCalledWith(LOGIN_CODE_PATH, "POST", {
+		provider: "claude", code: callback, loginAttemptId: "displayed-attempt",
+	}));
+	expect(mocks.request.mock.calls.filter(([path]) => path === LOGIN_CODE_PATH)).toHaveLength(1);
 });

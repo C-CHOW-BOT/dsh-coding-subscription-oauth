@@ -58,7 +58,7 @@ export interface ProviderCardProps {
 	usageError: string | undefined;
 	usageLoading: boolean;
 	onSignIn: (method: LoginMethod, targetAccountId?: string) => void | Promise<void>;
-	onBridgeSignIn?: (() => void) | undefined;
+	onBridgeSignIn?: ((targetAccountId?: string) => void | Promise<void>) | undefined;
 	bridgeActive?: boolean | undefined;
 	onUseManualCallback?: (() => void) | undefined;
 	onSignOut: () => void;
@@ -641,7 +641,11 @@ export function ProviderCard({
 														hint: t("accountReauthorizeHint"),
 														cancel: t("cancel"),
 													}}
-													onConfirm={async (method) => onSignIn(method as LoginMethod, account.id)}
+													onConfirm={async (method) => {
+														if (remoteClaude && method === "browser" && onBridgeSignIn !== undefined)
+															return onBridgeSignIn(account.id);
+														return onSignIn(method as LoginMethod, account.id);
+													}}
 												/>
 												<button
 													ref={removeTrigger}

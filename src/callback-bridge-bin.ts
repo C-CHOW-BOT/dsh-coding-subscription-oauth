@@ -53,7 +53,7 @@ export interface BridgeCliDependencies {
 	secureAgent(path: string): Promise<void>;
 	removeAgent(path: string): Promise<void>;
 	launchctl(args: string[]): Promise<number>;
-	exec(command: string, args: string[]): Promise<string>;
+	exec(command: string, args: string[], signal?: AbortSignal): Promise<string>;
 	probeHealth(timeoutMs: number): Promise<unknown>;
 	wait(milliseconds: number): Promise<void>;
 	now(): number;
@@ -293,7 +293,9 @@ async function uninstallBridge(dependencies: BridgeCliDependencies): Promise<voi
 export async function resolveBridgeRunConfig(
 	config: BridgeCliConfig,
 	dependencies: Pick<BridgeCliDependencies, "exec">,
+	signal?: AbortSignal,
 ): Promise<BridgeRunConfig> {
+	signal?.throwIfAborted();
 	const target = config.target;
 	if (target.kind === "browser" || target.kind === "ssh") return { remoteOrigin: config.remoteOrigin, target };
 	if (target.instance !== "auto") {
@@ -302,11 +304,14 @@ export async function resolveBridgeRunConfig(
 	}
 	let account: string;
 	let inventory: unknown;
+	const exec = (args: string[]): Promise<string> =>
+		signal === undefined ? dependencies.exec("gcloud", args) : dependencies.exec("gcloud", args, signal);
 	try {
-		account = (await dependencies.exec("gcloud", ["config", "get-value", "account", "--quiet"])).trim();
+		account = (await exec(["config", "get-value", "account", "--quiet"])).trim();
+		signal?.throwIfAborted();
 		if (!/^[^\s@]+@[^\s@]+$/u.test(account)) throw new Error("no active account");
 		inventory = JSON.parse(
-			await dependencies.exec("gcloud", [
+			await exec([
 				"compute",
 				"instances",
 				"list",
@@ -317,8 +322,10 @@ export async function resolveBridgeRunConfig(
 				"--quiet",
 			]),
 		);
+		signal?.throwIfAborted();
 		if (!Array.isArray(inventory)) throw new Error("invalid inventory");
 	} catch {
+		signal?.throwIfAborted();
 		throw new Error("GCP target discovery failed; authenticate gcloud, verify project access, then retry");
 	}
 	const owned = (inventory as unknown[]).filter((entry): entry is Record<string, unknown> => {
@@ -353,17 +360,30 @@ export async function resolveBridgeRunConfig(
 }
 
 async function runBridge(config: BridgeCliConfig, dependencies: BridgeCliDependencies): Promise<void> {
+	const cancellation = new AbortController();
+	const cancelled = Symbol("cancelled");
 	let stop: () => void = () => {};
-	const stopped = new Promise<void>((resolve) => {
-		stop = resolve;
+	const stopped = new Promise<typeof cancelled>((resolve) => {
+		stop = () => {
+			cancellation.abort();
+			resolve(cancelled);
+		};
 	});
 	dependencies.onSignal("SIGINT", stop);
 	dependencies.onSignal("SIGTERM", stop);
 	try {
-		const bridge = await dependencies.start({
-			...(await resolveBridgeRunConfig(config, dependencies)),
+		const resolved = await Promise.race([resolveBridgeRunConfig(config, dependencies, cancellation.signal), stopped]);
+		if (resolved === cancelled || cancellation.signal.aborted) return;
+		const starting = dependencies.start({
+			...resolved,
 			configurationId: bridgeConfigurationId(config),
 		});
+		const bridge = await Promise.race([starting, stopped]);
+		if (bridge === cancelled || cancellation.signal.aborted) {
+			// Observe a non-cooperative startup and close only the bridge it eventually returns.
+			void starting.then((lateBridge) => lateBridge.close()).catch(() => {});
+			return;
+		}
 		try {
 			dependencies.stdout(
 				`Claude callback bridge ready: ${bridge.url}\nKeep this process running while you sign in.\n`,
@@ -372,6 +392,8 @@ async function runBridge(config: BridgeCliConfig, dependencies: BridgeCliDepende
 		} finally {
 			await bridge.close();
 		}
+	} catch (error) {
+		if (!cancellation.signal.aborted) throw error;
 	} finally {
 		dependencies.removeSignal("SIGINT", stop);
 		dependencies.removeSignal("SIGTERM", stop);
@@ -487,32 +509,64 @@ export function defaultBridgeCliDependencies(): BridgeCliDependencies {
 				child.once("error", reject);
 				child.once("exit", (code) => resolve(code ?? 1));
 			}),
-		exec: (command, args) =>
+		exec: (command, args, signal) =>
 			new Promise<string>((resolve, reject) => {
-				const child = spawn(command, args, { stdio: ["ignore", "pipe", "ignore"], shell: false });
+				if (signal?.aborted) {
+					reject(new Error("GCP discovery was cancelled"));
+					return;
+				}
+				const ownsGroup = process.platform !== "win32";
+				const child = spawn(command, args, {
+					stdio: ["ignore", "pipe", "ignore"],
+					shell: false,
+					detached: ownsGroup,
+				});
 				let output = "";
 				let completed = false;
+				let abortKillTimer: ReturnType<typeof setTimeout> | undefined;
+				const signalChild = (value: NodeJS.Signals | 0): boolean => {
+					if (!ownsGroup || child.pid === undefined) return value === 0 ? false : child.kill(value);
+					try {
+						process.kill(-child.pid, value);
+						return true;
+					} catch {
+						return false;
+					}
+				};
 				const finish = (error?: Error): void => {
 					if (completed) return;
 					completed = true;
 					clearTimeout(timer);
+					signal?.removeEventListener("abort", onAbort);
 					if (error === undefined) resolve(output);
 					else reject(error);
 				};
+				const onAbort = (): void => {
+					if (completed) return;
+					if (signalChild("SIGTERM")) {
+						abortKillTimer = setTimeout(() => signalChild("SIGKILL"), 1000);
+					}
+					finish(new Error("GCP discovery was cancelled"));
+				};
 				const timer = setTimeout(() => {
-					child.kill("SIGKILL");
+					signalChild("SIGKILL");
 					finish(new Error("GCP discovery timed out"));
 				}, 30_000);
 				child.stdout?.setEncoding("utf8");
 				child.stdout?.on("data", (chunk: string) => {
 					output += chunk;
 					if (output.length > 1_048_576) {
-						child.kill("SIGKILL");
+						signalChild("SIGKILL");
 						finish(new Error("GCP discovery response was too large"));
 					}
 				});
 				child.once("error", () => finish(new Error("GCP discovery command could not start")));
-				child.once("close", (code) => finish(code === 0 ? undefined : new Error("GCP discovery command failed")));
+				child.once("close", (code) => {
+					if (!ownsGroup || !signalChild(0)) clearTimeout(abortKillTimer);
+					finish(code === 0 ? undefined : new Error("GCP discovery command failed"));
+				});
+				signal?.addEventListener("abort", onAbort, { once: true });
+				if (signal?.aborted) onAbort();
 			}),
 	};
 }

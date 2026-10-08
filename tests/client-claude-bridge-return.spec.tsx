@@ -46,7 +46,7 @@ it("submits a matching callback once and waits beyond POST acceptance for persis
 	await finishClaudeBridgeReturn(callback, controller.signal, { request: request as typeof jsonRequest, wait });
 	expect(request.mock.calls.filter(([path]) => path === STATUS_PATH)).toHaveLength(3);
 	expect(request.mock.calls.filter(([path]) => path === LOGIN_CODE_PATH)).toHaveLength(1);
-	expect(request).toHaveBeenCalledWith(LOGIN_CODE_PATH, "POST", { provider: "claude", code: callback }, controller.signal);
+	expect(request).toHaveBeenCalledWith(LOGIN_CODE_PATH, "POST", { provider: "claude", code: callback, loginAttemptId: attemptId }, controller.signal);
 	expect(wait).toHaveBeenCalledOnce();
 });
 

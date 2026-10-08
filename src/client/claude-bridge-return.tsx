@@ -59,7 +59,12 @@ export async function finishClaudeBridgeReturn(
 		throw new Error("This callback does not match a pending Claude sign-in.");
 	}
 	if (signal.aborted) throw new Error("Sign-in stopped.");
-	await dependencies.request(LOGIN_CODE_PATH, "POST", { provider: "claude", code: callback }, signal);
+	await dependencies.request(
+		LOGIN_CODE_PATH,
+		"POST",
+		{ provider: "claude", code: callback, loginAttemptId: attemptId },
+		signal,
+	);
 	for (let attempt = 0; attempt < 60; attempt += 1) {
 		if (signal.aborted) throw new Error("Sign-in stopped.");
 		const status = (await dependencies.request<CodingOAuthStatus>(STATUS_PATH, "GET", undefined, signal)).providers

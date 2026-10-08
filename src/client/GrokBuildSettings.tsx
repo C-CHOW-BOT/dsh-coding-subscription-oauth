@@ -317,9 +317,15 @@ export function GrokBuildSettings({ t, close, initialTab }: GrokBuildSettingsPro
 	const submitCode = async (provider: ProviderSlug, pastedCode?: string): Promise<void> => {
 		const code = (pastedCode ?? codeInputs[provider])?.trim() ?? "";
 		if (code.length === 0) return;
+		const pending = provider === "claude" ? status?.providers.claude : undefined;
+		const loginAttemptId = pending?.status === "signing-in" ? pending.loginAttemptId : undefined;
 		setBusyProvider(provider);
 		try {
-			await jsonRequest<{ ok: true }>(LOGIN_CODE_PATH, "POST", { provider, code });
+			await jsonRequest<{ ok: true }>(LOGIN_CODE_PATH, "POST", {
+				provider,
+				code,
+				...(loginAttemptId === undefined ? {} : { loginAttemptId }),
+			});
 			setCodeInputs((current) => ({ ...current, [provider]: "" }));
 			await refresh();
 		} catch (error: unknown) {
@@ -757,7 +763,7 @@ export function GrokBuildSettings({ t, close, initialTab }: GrokBuildSettingsPro
 						usageError={usageError}
 						usageLoading={usageLoading}
 						onSignIn={(slug, method, targetAccountId) => signIn(slug, method, targetAccountId)}
-						onClaudeBridgeSignIn={() => void signIn("claude", "browser", undefined, true)}
+						onClaudeBridgeSignIn={(targetAccountId) => signIn("claude", "browser", targetAccountId, true)}
 						claudeBridgeActive={claudeBridgeActive}
 						onUseManualClaudeCallback={() => {
 							bridgePopup.current?.close();

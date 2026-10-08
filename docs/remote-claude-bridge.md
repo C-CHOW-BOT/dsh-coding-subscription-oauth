@@ -21,7 +21,7 @@ Start a foreground helper with your exact DSH HTTPS origin:
 dsh-claude-bridge run --origin https://example.com
 ```
 
-Replace `https://example.com` with the website where you use DSH. The origin must have no path, query, credentials, or fragment. Other websites cannot start a login through this configured helper. Keep `run` active during sign-in; Ctrl+C or SIGTERM closes its own listeners.
+Replace `https://example.com` with the website where you use DSH. The origin must have no path, query, credentials, or fragment. Other websites cannot start a login through this configured helper. Keep `run` active during sign-in; Ctrl+C or SIGTERM cancels pending startup/discovery and closes its own listeners.
 
 ## Start automatically on macOS
 
@@ -51,11 +51,11 @@ Replace `VERSION` with the reviewed package version and use your DSH origin. Inc
 
 ## Default sign-in flow
 
-1. In remote DSH, choose the local bridge sign-in option.
+1. In remote DSH, choose the local bridge sign-in option. Confirmed browser reauthorization of an existing Claude account uses the same bridge and preserves the selected account target.
 2. The browser navigates to `http://127.0.0.1:53700/start`. The helper checks the configured DSH origin and pending Claude challenge. This is a top-level navigation, not a cross-origin browser fetch.
 3. The helper opens its localhost callback receiver at port `53692` before opening Claude.
 4. Authorize with Claude. Its callback reaches the local receiver, which checks that it belongs to the pending attempt.
-5. The helper returns your browser to the exact configured DSH origin with the callback in a URL fragment. The authenticated DSH page consumes the fragment and automatically submits the callback, without reading or copying your clipboard.
+5. The helper returns your browser to the exact configured DSH origin with the callback in a URL fragment. The authenticated DSH page consumes the fragment and automatically submits the callback with its pending login-operation ID, without reading or copying your clipboard. DSH checks that operation before consuming the callback, so an old return cannot replace a newer authorization.
 6. DSH completes credential exchange and storage. The return page reports success only when signed-in status includes the completion receipt for this same login attempt. Keep DSH Settings open to see the final account state.
 
 The callback fragment stays in the browser and is not sent in the initial website HTTP request. DSH removes it after consuming it. The helper does not receive your DSH browser cookies or store Claude tokens.

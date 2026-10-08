@@ -500,7 +500,10 @@ export class SubscriptionWebAuth {
 		});
 	}
 
-	async submitCode(code: string): Promise<void> {
+	async submitCode(code: string, expectedAttemptId?: string): Promise<void> {
+		if (expectedAttemptId !== undefined && expectedAttemptId !== this.loginAttemptId) {
+			throw new Error(`${this.session.definition.route}: callback does not match the pending login attempt`);
+		}
 		const resolver = this.codeResolver;
 		if (resolver === undefined) {
 			throw new Error(`${this.session.definition.route}: no authorization-code login is waiting for a code`);
@@ -510,30 +513,43 @@ export class SubscriptionWebAuth {
 	}
 
 	async cancel(): Promise<void> {
+		const attemptId = this.loginAttemptId;
+		const operation = this.operation;
 		this.cancellation?.abort(new Error(`${this.session.definition.route}: sign-in cancelled`));
-		await this.operation?.catch(() => undefined);
+		await operation?.catch(() => undefined);
+		const stillCurrent = () =>
+			this.loginAttemptId === attemptId && (this.operation === undefined || this.operation === operation);
+		if (!stillCurrent()) return;
 		this.lastLoginError = undefined;
 		this.completedLoginAttemptId = undefined;
 		this.codeResolver = undefined;
 		this.challenge = undefined;
-		this.state = await this.readStoredStatus();
+		const stored = await this.readStoredStatus();
+		if (stillCurrent()) this.state = stored;
 	}
 
 	async setModels(ids: readonly string[] | undefined): Promise<void> {
 		await this.session.setSelectedModels(ids);
-		this.state = await this.readStoredStatus();
+		await this.refreshStoredStateWhenIdle();
 	}
 
 	async setActiveAccount(id: string): Promise<void> {
 		await this.session.store.setActiveAccount(id);
 		this.session.notifyCredentialChange();
-		this.state = await this.readStoredStatus();
+		await this.refreshStoredStateWhenIdle();
 	}
 
 	async removeAccount(id: string): Promise<void> {
 		await this.session.store.removeAccount(id);
 		this.session.notifyCredentialChange();
-		this.state = await this.readStoredStatus();
+		await this.refreshStoredStateWhenIdle();
+	}
+
+	private async refreshStoredStateWhenIdle(): Promise<void> {
+		if (this.operation !== undefined) return;
+		const attemptId = this.loginAttemptId;
+		const stored = await this.readStoredStatus();
+		if (this.operation === undefined && this.loginAttemptId === attemptId) this.state = stored;
 	}
 
 	async signOut(): Promise<void> {
@@ -971,12 +987,20 @@ export function registerCodingOAuthRoutes(
 					try {
 						const body = await readJsonRequest(req);
 						const slug = providerSlug(body);
-						const code = recordBody(body)["code"];
+						const value = recordBody(body);
+						const code = value["code"];
+						const loginAttemptId = value["loginAttemptId"];
 						if (typeof code !== "string" || code.trim().length === 0) {
 							return json(res, 400, { error: "code must be a non-empty string" });
 						}
+						if (
+							loginAttemptId !== undefined &&
+							(typeof loginAttemptId !== "string" || loginAttemptId.trim().length === 0)
+						) {
+							return json(res, 400, { error: "loginAttemptId must be a non-empty string" });
+						}
 						if (slug === "grok") await grok.submitCode(code);
-						else await subscription(slug).submitCode(code);
+						else await subscription(slug).submitCode(code, loginAttemptId);
 						json(res, 200, { ok: true });
 					} catch (error: unknown) {
 						json(res, requestErrorStatus(error, 409), { error: safeMessage(error) });
