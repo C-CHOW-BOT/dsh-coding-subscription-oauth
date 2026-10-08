@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
 	BRIDGE_LAUNCH_AGENT_LABEL,
+	type BridgeCliConfig,
 	type BridgeCliDependencies,
+	bridgeConfigurationId,
 	bridgeLaunchAgentPlist,
 	parseBridgeArguments,
 	resolveBridgeRunConfig,
@@ -10,11 +12,13 @@ import {
 
 const SSH_ARGS = ["--origin", "https://example.com", "--ssh-host", "dsh-example"];
 const CONFIG = { remoteOrigin: "https://example.com", target: { kind: "ssh" as const, host: "dsh-example" } };
+const BROWSER_CONFIG = { remoteOrigin: "https://example.com", target: { kind: "browser" as const } };
 
-function fixture() {
+function fixture(config: BridgeCliConfig = CONFIG) {
 	const files = new Map<string, string>();
 	const signals = new Map<string, () => void>();
 	const close = vi.fn(async () => {});
+	let elapsed = 0;
 	const dependencies: BridgeCliDependencies = {
 		platform: "darwin",
 		home: "/example-home",
@@ -44,12 +48,24 @@ function fixture() {
 		exec: vi.fn(async () => {
 			throw new Error("unexpected command");
 		}),
+		probeHealth: vi.fn(async () => ({
+			service: "dsh-claude-bridge",
+			protocol: 1,
+			configurationId: bridgeConfigurationId(config),
+		})),
+		wait: vi.fn(async (milliseconds) => {
+			elapsed += milliseconds;
+		}),
+		now: () => elapsed,
 	};
 	return {
 		dependencies,
 		files,
 		signals,
 		close,
+		advance: (milliseconds: number) => {
+			elapsed += milliseconds;
+		},
 		path: `/example-home/Library/LaunchAgents/${BRIDGE_LAUNCH_AGENT_LABEL}.plist`,
 	};
 }
@@ -129,8 +145,8 @@ describe("callback bridge process lifecycle", () => {
 		const running = runCallbackBridgeCli(["run", "--origin", "https://example.com"], dependencies);
 		await vi.waitFor(() => expect(dependencies.start).toHaveBeenCalled());
 		expect(dependencies.start).toHaveBeenCalledWith({
-			remoteOrigin: "https://example.com",
-			target: { kind: "browser" },
+			...BROWSER_CONFIG,
+			configurationId: bridgeConfigurationId(BROWSER_CONFIG),
 		});
 		expect(dependencies.exec).not.toHaveBeenCalled();
 		signals.get("SIGTERM")?.();
@@ -142,7 +158,7 @@ describe("callback bridge process lifecycle", () => {
 		const { dependencies, signals, close } = fixture();
 		const running = runCallbackBridgeCli(SSH_ARGS, dependencies);
 		await vi.waitFor(() => expect(dependencies.stdout).toHaveBeenCalled());
-		expect(dependencies.start).toHaveBeenCalledWith(CONFIG);
+		expect(dependencies.start).toHaveBeenCalledWith({ ...CONFIG, configurationId: bridgeConfigurationId(CONFIG) });
 		signals.get(signal)?.();
 		signals.get(signal)?.();
 		expect(await running).toBe(0);
@@ -179,8 +195,42 @@ describe("callback bridge process lifecycle", () => {
 });
 
 describe("per-user macOS bridge installer", () => {
+	it.each([
+		["bad.name", "example-project", "us-central1-a"],
+		["example-vm", "Example_Project", "us-central1-a"],
+		["example-vm", "example-project", "us_central1_a"],
+		["1invalid-vm", "example-project", "us-central1-a"],
+		["x".repeat(64), "example-project", "us-central1-a"],
+		["auto", "Example_Project", "us-central1-a"],
+	])(
+		"rejects a core-invalid GCP target before writing or starting a LaunchAgent: %j",
+		async (instance, project, zone) => {
+			const { dependencies } = fixture();
+			expect(
+				await runCallbackBridgeCli(
+					[
+						"install",
+						"--origin",
+						"https://example.com",
+						"--gcp-instance",
+						instance,
+						"--gcp-project",
+						project,
+						"--gcp-zone",
+						zone,
+					],
+					dependencies,
+				),
+			).toBe(1);
+			expect(dependencies.writeAgent).not.toHaveBeenCalled();
+			expect(dependencies.launchctl).not.toHaveBeenCalled();
+			expect(dependencies.start).not.toHaveBeenCalled();
+			expect(dependencies.exec).not.toHaveBeenCalled();
+		},
+	);
+
 	it("installs the default origin-only browser mode without cloud configuration", async () => {
-		const { dependencies, files, path } = fixture();
+		const { dependencies, files, path } = fixture(BROWSER_CONFIG);
 		expect(await runCallbackBridgeCli(["install", "--origin", "https://example.com"], dependencies)).toBe(0);
 		expect(files.get(path)).toContain("<string>--origin</string>");
 		expect(files.get(path)).not.toContain("--gcp-");
@@ -207,6 +257,84 @@ describe("per-user macOS bridge installer", () => {
 		expect(dependencies.launchctl).toHaveBeenCalledWith(["bootstrap", "gui/501", path]);
 		expect(dependencies.launchctl).toHaveBeenCalledWith(["kickstart", `gui/501/${BRIDGE_LAUNCH_AGENT_LABEL}`]);
 		expect(dependencies.start).not.toHaveBeenCalled();
+		expect(dependencies.probeHealth).toHaveBeenCalledWith(500);
+		expect(dependencies.stdout).toHaveBeenCalledWith(expect.stringContaining("installed"));
+	});
+
+	it("waits for matching local readiness before reporting success", async () => {
+		const { dependencies } = fixture();
+		const ready = await dependencies.probeHealth(500);
+		dependencies.probeHealth = vi
+			.fn()
+			.mockResolvedValueOnce(undefined)
+			.mockRejectedValueOnce(new Error("private-response private-origin private-target"))
+			.mockResolvedValueOnce(ready);
+		expect(await runCallbackBridgeCli(["install", ...SSH_ARGS], dependencies)).toBe(0);
+		expect(dependencies.wait).toHaveBeenCalledTimes(2);
+		expect(dependencies.stdout).toHaveBeenCalledTimes(1);
+		expect(dependencies.stderr).not.toHaveBeenCalled();
+	});
+
+	it("bounds missing-service polling to five seconds without exposing probe errors or claiming success", async () => {
+		const { dependencies, files, path, advance } = fixture();
+		dependencies.probeHealth = vi.fn(async (timeoutMs) => {
+			advance(timeoutMs);
+			throw new Error("private-response private-origin private-target");
+		});
+		expect(await runCallbackBridgeCli(["install", ...SSH_ARGS], dependencies)).toBe(1);
+		expect(dependencies.now()).toBe(5_000);
+		expect(dependencies.stdout).not.toHaveBeenCalled();
+		expect(dependencies.stderr).toHaveBeenCalledWith(expect.stringContaining("within five seconds"));
+		expect(dependencies.stderr).toHaveBeenCalledWith(expect.stringContaining("uninstall"));
+		expect(dependencies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("private-"));
+		expect(files.has(path)).toBe(true);
+		expect(dependencies.removeAgent).not.toHaveBeenCalled();
+		expect(dependencies.launchctl).not.toHaveBeenCalledWith(expect.arrayContaining(["bootout"]));
+	});
+
+	it("does not accept a matching response received after the installation deadline", async () => {
+		const { dependencies, advance } = fixture();
+		const ready = await dependencies.probeHealth(500);
+		dependencies.probeHealth = vi.fn(async () => {
+			advance(5_001);
+			return ready;
+		});
+		expect(await runCallbackBridgeCli(["install", ...SSH_ARGS], dependencies)).toBe(1);
+		expect(dependencies.stdout).not.toHaveBeenCalled();
+		expect(dependencies.stderr).toHaveBeenCalledWith(expect.stringContaining("within five seconds"));
+	});
+
+	it.each([
+		null,
+		{ service: "unrelated-service", protocol: 1, configurationId: bridgeConfigurationId(CONFIG) },
+		{ service: "dsh-claude-bridge", protocol: 2, configurationId: bridgeConfigurationId(CONFIG) },
+		{
+			service: "dsh-claude-bridge",
+			protocol: 1,
+			configurationId: bridgeConfigurationId(BROWSER_CONFIG),
+		},
+		{ service: "dsh-claude-bridge", protocol: "1", configurationId: bridgeConfigurationId(CONFIG) },
+	])("rejects a stale or unrelated running service without restarting it: %j", async (health) => {
+		const { dependencies, files, path } = fixture();
+		const existing = bridgeLaunchAgentPlist(
+			CONFIG,
+			dependencies.nodeExecutable,
+			dependencies.binPath,
+			dependencies.executableSearchPath,
+		);
+		files.set(path, existing);
+		dependencies.launchctl = vi.fn(async () => 0);
+		dependencies.probeHealth = vi.fn(async () => health);
+		expect(await runCallbackBridgeCli(["install", ...SSH_ARGS], dependencies)).toBe(1);
+		expect(dependencies.stdout).not.toHaveBeenCalled();
+		expect(dependencies.stderr).toHaveBeenCalledWith(expect.stringContaining("does not match"));
+		expect(dependencies.stderr).toHaveBeenCalledWith(expect.stringContaining("uninstall"));
+		expect(files.get(path)).toBe(existing);
+		expect(dependencies.writeAgent).not.toHaveBeenCalled();
+		expect(dependencies.removeAgent).not.toHaveBeenCalled();
+		expect(dependencies.wait).not.toHaveBeenCalled();
+		expect(dependencies.launchctl).not.toHaveBeenCalledWith(expect.arrayContaining(["-k"]));
+		expect(dependencies.launchctl).not.toHaveBeenCalledWith(expect.arrayContaining(["bootout"]));
 	});
 
 	it("reuses the exact owned configuration without rewriting or restarting an existing agent", async () => {
@@ -444,7 +572,7 @@ describe("automatic GCP devbox discovery", () => {
 	});
 
 	it("stores the automatic target at install time and discovers it only when run starts", async () => {
-		const { dependencies, files, path } = fixture();
+		const { dependencies, files, path } = fixture(auto);
 		expect(
 			await runCallbackBridgeCli(
 				["install", "--origin", "https://example.com", "--gcp-instance", "auto", "--gcp-project", "example-project"],
@@ -454,5 +582,29 @@ describe("automatic GCP devbox discovery", () => {
 		expect(files.get(path)).toContain("<string>auto</string>");
 		expect(files.get(path)).not.toContain("--gcp-zone");
 		expect(dependencies.exec).not.toHaveBeenCalled();
+	});
+
+	it("retains the original automatic configuration identity after resolving its runtime target", async () => {
+		const { dependencies, signals } = fixture(auto);
+		dependencies.exec = vi
+			.fn()
+			.mockResolvedValueOnce("user@example.com")
+			.mockResolvedValueOnce(JSON.stringify([instance("owned-vm", "user@example.com")]));
+		const running = runCallbackBridgeCli(
+			["run", "--origin", "https://example.com", "--gcp-instance", "auto", "--gcp-project", "example-project"],
+			dependencies,
+		);
+		await vi.waitFor(() => expect(dependencies.start).toHaveBeenCalled());
+		const resolved = {
+			remoteOrigin: "https://example.com",
+			target: { kind: "gcp" as const, instance: "owned-vm", project: "example-project", zone: "us-central1-a" },
+		};
+		expect(dependencies.start).toHaveBeenCalledWith({
+			...resolved,
+			configurationId: bridgeConfigurationId(auto),
+		});
+		expect(bridgeConfigurationId(auto)).not.toBe(bridgeConfigurationId(resolved));
+		signals.get("SIGTERM")?.();
+		expect(await running).toBe(0);
 	});
 });

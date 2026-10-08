@@ -89,6 +89,9 @@ export type SubscriptionWebAuthStatus = {
     available: string[];
     selected: string[];
     selectionMode?: "default" | "selected";
+    /** Opaque, token-free receipt correlating browser completion with one login operation. */
+    loginAttemptId?: string;
+    completedLoginAttemptId?: string;
 } & ({
     status: "signed-out";
 } | {
@@ -117,6 +120,8 @@ export declare class SubscriptionWebAuth {
     private state;
     private operation;
     private lastLoginError;
+    private loginAttemptId;
+    private completedLoginAttemptId;
     private cancellation;
     private method;
     private loginPersist;

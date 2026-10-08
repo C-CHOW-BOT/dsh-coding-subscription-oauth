@@ -1,4 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createServer, request, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
@@ -76,6 +77,7 @@ async function fixture(
 		ttl?: number;
 		ignoreTerm?: boolean;
 		beforeBrowserReady?: () => Promise<void>;
+		configurationId?: string;
 	} = {},
 ) {
 	const callbacks: string[] = [];
@@ -110,6 +112,7 @@ async function fixture(
 	const bridge = await startCallbackBridge({
 		target: options.target ?? { kind: "ssh", host: "devbox.example.com" },
 		remoteOrigin,
+		...(options.configurationId === undefined ? {} : { configurationId: options.configurationId }),
 		_test: {
 			controlPort: 0,
 			callbackPort,
@@ -172,6 +175,48 @@ async function fixture(
 }
 
 describe("local Claude callback bridge", () => {
+	it("exposes only protocol and configuration identity in its loopback health response", async () => {
+		const f = await fixture({ target: { kind: "browser" } });
+		expect((await f.start()).status).toBe(200);
+		const response = await fetch(`${f.controlOrigin}/health`);
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({
+			service: "dsh-claude-bridge",
+			protocol: 1,
+			configurationId: createHash("sha256")
+				.update(JSON.stringify([remoteOrigin, "browser"]))
+				.digest("hex"),
+		});
+		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(response.headers.get("access-control-allow-origin")).toBeNull();
+		expect(f.spawns).toHaveLength(0);
+	});
+
+	it("uses the supplied original configuration fingerprint after optional target discovery", async () => {
+		const configurationId = "a".repeat(64);
+		const f = await fixture({
+			target: { kind: "gcp", instance: "example-vm", project: "example-project", zone: "us-central1-a" },
+			configurationId,
+		});
+		const payload = await (await fetch(`${f.controlOrigin}/health`)).json();
+		expect(payload).toEqual({ service: "dsh-claude-bridge", protocol: 1, configurationId });
+		expect(JSON.stringify(payload)).not.toContain(remoteOrigin);
+		expect(JSON.stringify(payload)).not.toContain("example-project");
+		expect(JSON.stringify(payload)).not.toContain("example-vm");
+		expect(JSON.stringify(payload)).not.toContain("us-central1-a");
+		expect(f.spawns).toHaveLength(0);
+	});
+
+	it("rejects health requests with non-loopback Host or unsupported methods and invalid identity", async () => {
+		const f = await fixture();
+		expect(await rawGet(`${f.controlOrigin}/health`, { Host: "evil.example.com" })).toBe(403);
+		expect(await rawGet(`${f.controlOrigin}/health`, { Host: `127.0.0.1:1` })).toBe(403);
+		expect((await fetch(`${f.controlOrigin}/health`, { method: "POST" })).status).toBe(405);
+		await expect(
+			startCallbackBridge({ target: { kind: "browser" }, remoteOrigin, configurationId: "invalid" }),
+		).rejects.toThrow("fingerprint");
+	});
+
 	it("reuses a fully ready browser challenge and replaces only its owned cancelled attempt for a new state", async () => {
 		const f = await fixture({ target: { kind: "browser" } });
 		expect((await f.start()).status).toBe(200);
@@ -212,6 +257,38 @@ describe("local Claude callback bridge", () => {
 		}
 		expect((await first).status).toBe(200);
 		expect((await f.start()).status).toBe(200);
+	});
+
+	it("releases an owned browser listener for a fresh retry overlapping its initial preparation", async () => {
+		let entered = false;
+		let ready: () => void = () => {};
+		const gate = new Promise<void>((resolve) => {
+			ready = resolve;
+		});
+		const f = await fixture({
+			target: { kind: "browser" },
+			beforeBrowserReady: async () => {
+				entered = true;
+				await gate;
+			},
+		});
+		const first = f.start();
+		await expect.poll(() => entered).toBe(true);
+		const freshAuth = authUrl.replace("state=fixture-state", "state=fresh-state");
+		const retry = f.start({ authUrl: freshAuth, remoteOrigin });
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		} finally {
+			ready();
+		}
+		// The first response may finish just before replacement, or report that its own setup was cancelled.
+		expect([200, 503]).toContain((await first).status);
+		expect((await retry).status).toBe(200);
+		const callback = `http://127.0.0.1:${f.callbackPort}/callback`;
+		expect((await fetch(`${callback}?code=old-code&state=fixture-state`)).status).toBe(400);
+		expect((await fetch(`${callback}?code=fresh-code&state=fresh-state`, { redirect: "manual" })).status).toBe(303);
+		expect(f.spawns).toHaveLength(0);
+		expect(f.child.signals).toHaveLength(0);
 	});
 
 	it("returns matching browser callbacks through an exact remote-origin fragment without SSH, IAM or claiming a forward port", async () => {
@@ -361,6 +438,25 @@ describe("local Claude callback bridge", () => {
 		expect(f.callbacks).toEqual(["/callback?code=fixture-code&state=fixture-state"]);
 		await expect.poll(() => f.child.signals).toContain("SIGTERM");
 		expect((await f.pageToken()).response.status).toBe(200);
+	});
+
+	it("lets an accepted native callback finish after the pending-login lease expires", async () => {
+		const f = await fixture({ ttl: 80 });
+		expect((await f.start()).status).toBe(200);
+		f.delayCallback();
+		const delivered = fetch(`http://127.0.0.1:${f.callbackPort}/callback?code=fixture-code&state=fixture-state`).then(
+			(response) => response,
+			(error: unknown) => error,
+		);
+		await expect.poll(() => f.callbacks.length).toBe(1);
+		await new Promise((resolve) => setTimeout(resolve, 120));
+		expect(f.child.signals).toHaveLength(0);
+		f.releaseCallback();
+		const result = await delivered;
+		expect(result).toBeInstanceOf(Response);
+		expect((result as Response).status).toBe(200);
+		expect(await (result as Response).text()).toContain("DSH is finishing sign-in");
+		await expect.poll(() => f.child.signals).toContain("SIGTERM");
 	});
 
 	it("fails on callback port conflicts without spawning or killing an existing service", async () => {

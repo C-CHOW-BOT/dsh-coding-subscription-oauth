@@ -31,9 +31,23 @@ After verifying the foreground helper, stop it with Ctrl+C and install the backg
 dsh-claude-bridge install --origin https://example.com
 ```
 
-This starts a per-user LaunchAgent immediately and again when you log in. The file has mode `0600` and label `io.dsh.claude-callback-bridge`. It records absolute Node and CLI paths, connection arguments, and your executable `PATH`; it does not copy the rest of your environment or store account credentials.
+This starts a per-user LaunchAgent immediately and again when you log in. Before reporting success, installation checks the local helper's service identity, protocol, and configured origin and transport fingerprint for up to five seconds. An unavailable or stale helper produces an error with uninstall/reinstall guidance; installation leaves existing processes and its owned file available for diagnosis. Helper readiness is separate from Claude credential exchange.
+
+The file has mode `0600` and label `io.dsh.claude-callback-bridge`. It records absolute Node and CLI paths, connection arguments, and your executable `PATH`; it does not copy the rest of your environment or store account credentials.
 
 Repeating an identical installation is safe. A conflicting file or configuration is preserved. To change an owned installation, uninstall it and install the intended configuration. Do not overwrite an unrelated LaunchAgent. Starting the local helper does not require a DSH restart. On other systems, use the foreground `run` command.
+
+## Upgrade the macOS background helper
+
+Stop the owned background helper before upgrading the global package, then install it again with the intended options:
+
+```bash
+dsh-claude-bridge uninstall
+npm install --global ./dsh-coding-subscription-oauth-VERSION.tgz
+dsh-claude-bridge install --origin https://example.com
+```
+
+Replace `VERSION` with the reviewed package version and use your DSH origin. Include your SSH or GCP options again if you use forwarding. Updating package files alone does not reload an already running Node process. Uninstalling first releases the owned helper; installing afterward starts the new package and verifies its local readiness. Stop a separately started foreground helper with Ctrl+C before this sequence.
 
 ## Default sign-in flow
 
@@ -42,11 +56,11 @@ Repeating an identical installation is safe. A conflicting file or configuration
 3. The helper opens its localhost callback receiver at port `53692` before opening Claude.
 4. Authorize with Claude. Its callback reaches the local receiver, which checks that it belongs to the pending attempt.
 5. The helper returns your browser to the exact configured DSH origin with the callback in a URL fragment. The authenticated DSH page consumes the fragment and automatically submits the callback, without reading or copying your clipboard.
-6. DSH completes credential exchange and updates its actual account status. Keep DSH Settings open to see the final result.
+6. DSH completes credential exchange and storage. The return page reports success only when signed-in status includes the completion receipt for this same login attempt. Keep DSH Settings open to see the final account state.
 
 The callback fragment stays in the browser and is not sent in the initial website HTTP request. DSH removes it after consuming it. The helper does not receive your DSH browser cookies or store Claude tokens.
 
-A received callback or a browser return does not prove that credential exchange and storage succeeded. DSH's signed-in status is authoritative. A pending helper attempt expires after five minutes. Use a new DSH authorization attempt after a timeout or failure; existing authenticated accounts are independent of a pending attempt.
+A received callback or a browser return does not prove that credential exchange and storage succeeded. Automatic completion requires signed-in status with a matching operation receipt and no operation error; an older account that remains signed in after failure or cancellation is insufficient. The DSH server and client must both support these receipts. A pending helper attempt expires after five minutes. Use a new DSH authorization attempt after a timeout or failure; existing authenticated accounts are independent of a pending attempt.
 
 ## Optional SSH or Google Cloud forwarding
 

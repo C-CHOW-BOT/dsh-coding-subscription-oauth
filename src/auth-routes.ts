@@ -1,6 +1,7 @@
 import type { LoginPersistOptions } from "./store.ts";
 /** Same-origin Web settings routes for Grok Build OAuth. */
 
+import { randomUUID } from "node:crypto";
 import type { ServerResponse } from "node:http";
 import type { Context } from "@deepseek-ai/cordis";
 import type {} from "@deepseek-ai/dsh-host-webserver";
@@ -385,6 +386,9 @@ export type SubscriptionWebAuthStatus = {
 	available: string[];
 	selected: string[];
 	selectionMode?: "default" | "selected";
+	/** Opaque, token-free receipt correlating browser completion with one login operation. */
+	loginAttemptId?: string;
+	completedLoginAttemptId?: string;
 } & (
 	| { status: "signed-out" }
 	| { status: "signing-in"; method: SubscriptionLoginMethod; url?: string; userCode?: string }
@@ -416,6 +420,8 @@ export class SubscriptionWebAuth {
 	private state: SubscriptionWebAuthStatus | undefined;
 	private operation: Promise<void> | undefined;
 	private lastLoginError: string | undefined;
+	private loginAttemptId: string | undefined;
+	private completedLoginAttemptId: string | undefined;
 	private cancellation: AbortController | undefined;
 	private method: SubscriptionLoginMethod;
 	private loginPersist: LoginPersistOptions = { mode: "add" };
@@ -432,9 +438,25 @@ export class SubscriptionWebAuth {
 	}
 
 	async status(): Promise<SubscriptionWebAuthStatus & { operationError?: string }> {
-		if (this.operation !== undefined && this.state !== undefined) return this.state;
+		if (this.operation !== undefined && this.state !== undefined) {
+			return {
+				...this.state,
+				...(this.state.status === "signing-in" && this.loginAttemptId !== undefined
+					? { loginAttemptId: this.loginAttemptId }
+					: {}),
+				...(this.completedLoginAttemptId === undefined
+					? {}
+					: { completedLoginAttemptId: this.completedLoginAttemptId }),
+			};
+		}
+		const completedLoginAttemptId = this.completedLoginAttemptId;
+		const operationError = this.lastLoginError;
 		const stored = await this.readStoredStatus();
-		return this.lastLoginError === undefined ? stored : { ...stored, operationError: this.lastLoginError };
+		return {
+			...stored,
+			...(completedLoginAttemptId === undefined ? {} : { completedLoginAttemptId }),
+			...(operationError === undefined ? {} : { operationError }),
+		};
 	}
 
 	async signIn(
@@ -491,6 +513,7 @@ export class SubscriptionWebAuth {
 		this.cancellation?.abort(new Error(`${this.session.definition.route}: sign-in cancelled`));
 		await this.operation?.catch(() => undefined);
 		this.lastLoginError = undefined;
+		this.completedLoginAttemptId = undefined;
 		this.codeResolver = undefined;
 		this.challenge = undefined;
 		this.state = await this.readStoredStatus();
@@ -517,6 +540,7 @@ export class SubscriptionWebAuth {
 		this.cancellation?.abort(new Error(`${this.session.definition.route}: sign-in cancelled`));
 		await this.operation?.catch(() => undefined);
 		this.lastLoginError = undefined;
+		this.completedLoginAttemptId = undefined;
 		this.codeResolver = undefined;
 		await this.session.logout();
 		this.challenge = undefined;
@@ -527,6 +551,7 @@ export class SubscriptionWebAuth {
 		this.cancellation?.abort(new Error(`${this.session.definition.route}: plugin disposed`));
 		await this.operation?.catch(() => undefined);
 		this.lastLoginError = undefined;
+		this.completedLoginAttemptId = undefined;
 		this.codeResolver = undefined;
 		this.rejectChallenge(new Error(`${this.session.definition.route}: plugin disposed`));
 	}
@@ -569,6 +594,9 @@ export class SubscriptionWebAuth {
 
 	private start(method: SubscriptionLoginMethod): void {
 		this.lastLoginError = undefined;
+		const loginAttemptId = randomUUID();
+		this.loginAttemptId = loginAttemptId;
+		this.completedLoginAttemptId = undefined;
 		const cancellation = new AbortController();
 		this.cancellation = cancellation;
 		this.method = method;
@@ -577,6 +605,7 @@ export class SubscriptionWebAuth {
 		this.operation = this.run(cancellation)
 			.then(
 				async () => {
+					if (!cancellation.signal.aborted) this.completedLoginAttemptId = loginAttemptId;
 					if (this.challenge === undefined)
 						this.rejectChallenge(new Error(`${this.session.definition.route}: login completed without a challenge`));
 					this.state = await this.readStoredStatus();

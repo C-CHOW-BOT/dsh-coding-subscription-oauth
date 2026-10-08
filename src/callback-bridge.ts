@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createServer, type IncomingMessage, request, type Server, type ServerResponse } from "node:http";
 import { createServer as createTcpServer } from "node:net";
 
@@ -13,6 +13,8 @@ type TunnelProcess = Pick<ChildProcess, "once" | "removeListener" | "kill" | "pi
 export interface CallbackBridgeOptions {
 	target: BridgeTarget;
 	remoteOrigin: string;
+	/** Non-secret configuration fingerprint supplied by the CLI before optional target discovery. */
+	configurationId?: string;
 	/** Dependency injection for isolated tests. The installed CLI never accepts these options. */
 	_test?: {
 		controlPort?: number;
@@ -300,6 +302,20 @@ export async function startCallbackBridge(
 	options: CallbackBridgeOptions,
 ): Promise<{ url: string; close(): Promise<void> }> {
 	const remoteOrigin = configuredOrigin(options.remoteOrigin, options._test?.allowHttpOrigin);
+	const targetFields =
+		options.target.kind === "browser"
+			? []
+			: options.target.kind === "ssh"
+				? [options.target.host]
+				: [options.target.instance, options.target.project, options.target.zone];
+	const configurationId =
+		options.configurationId ??
+		createHash("sha256")
+			.update(JSON.stringify([remoteOrigin, options.target.kind, ...targetFields]))
+			.digest("hex");
+	if (typeof configurationId !== "string" || !/^[a-f0-9]{64}$/u.test(configurationId)) {
+		throw new Error("Invalid bridge configuration fingerprint.");
+	}
 	const callbackPort = options._test?.callbackPort ?? CALLBACK_PORT;
 	const forwardPort = options._test?.forwardPort ?? FORWARD_PORT;
 	const command = options.target.kind === "browser" ? undefined : tunnelCommand(options.target, forwardPort);
@@ -386,6 +402,8 @@ export async function startCallbackBridge(
 					} catch {
 						return json(res, 400, { error: "Invalid callback." });
 					}
+					// The pending-login lease ends when its callback arrives. Forwarding has its own bounded request timeout.
+					clearTimeout(session.timer);
 					session.used = true;
 					res.once("close", () => {
 						void session.stop();
@@ -501,6 +519,10 @@ export async function startCallbackBridge(
 	const control = createServer((req, res) => {
 		void (async () => {
 			if (!localPeer(req, controlPort) || closed) return json(res, 403, { error: "Forbidden." });
+			if (req.url === "/health") {
+				if (req.method !== "GET") return json(res, 405, { error: "Method not allowed." });
+				return json(res, 200, { service: "dsh-claude-bridge", protocol: 1, configurationId });
+			}
 			if (req.url !== "/start") return json(res, 404, { error: "Not found." });
 			if (req.method === "GET") {
 				let referringOrigin = "";

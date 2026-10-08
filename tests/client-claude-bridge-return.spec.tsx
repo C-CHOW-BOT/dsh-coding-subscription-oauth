@@ -10,7 +10,8 @@ const mocks = vi.hoisted(() => ({ request: vi.fn() }));
 vi.mock("../src/client/api.ts", async () => ({ ...await vi.importActual("../src/client/api.ts"), jsonRequest: mocks.request }));
 const challenge = "https://claude.ai/oauth/authorize?state=pending-state&redirect_uri=http%3A%2F%2Flocalhost%3A53692%2Fcallback";
 const callback = "http://localhost:53692/callback?code=fixture-code&state=pending-state";
-const pending = { status: "signing-in", method: "browser", url: challenge };
+const attemptId = "fixture-attempt";
+const pending = { status: "signing-in", method: "browser", url: challenge, loginAttemptId: attemptId };
 const status = (claude: unknown) => ({ providers: { claude } });
 const cleanups: Array<() => void> = [];
 afterEach(() => { for (const dispose of cleanups.splice(0)) dispose(); vi.restoreAllMocks(); mocks.request.mockReset(); window.history.replaceState(null, "", "/"); });
@@ -40,7 +41,7 @@ it("clears duplicate or oversized payloads but preserves unrelated fragments", (
 it("submits a matching callback once and waits beyond POST acceptance for persisted signed-in state", async () => {
 	const controller = new AbortController();
 	let confirmed = false;
-	const request = vi.fn(async (path: string) => path === LOGIN_CODE_PATH ? { ok: true } : status(confirmed ? { status: "signed-in" } : pending));
+	const request = vi.fn(async (path: string) => path === LOGIN_CODE_PATH ? { ok: true } : status(confirmed ? { status: "signed-in", completedLoginAttemptId: attemptId } : pending));
 	const wait = vi.fn(async () => { confirmed = true; });
 	await finishClaudeBridgeReturn(callback, controller.signal, { request: request as typeof jsonRequest, wait });
 	expect(request.mock.calls.filter(([path]) => path === STATUS_PATH)).toHaveLength(3);
@@ -54,6 +55,8 @@ it.each([
 	status({ status: "signed-in" }),
 	status({ ...pending, method: "device" }),
 	status({ ...pending, url: challenge.replace("claude.ai", "example.com") }),
+	status({ ...pending, loginAttemptId: undefined }),
+	status({ ...pending, loginAttemptId: "" }),
 ])("rejects a stale or unrelated pending login before submission", async (initial) => {
 	const request = vi.fn(async () => initial);
 	await expect(finishClaudeBridgeReturn(callback, new AbortController().signal, { request: request as typeof jsonRequest, wait: vi.fn() })).rejects.toThrow();
@@ -64,6 +67,29 @@ it("does not report success when native exchange fails after accepting the callb
 	let reads = 0;
 	const request = vi.fn(async (path: string) => path === LOGIN_CODE_PATH ? { ok: true } : status(++reads === 1 ? pending : { status: "error" }));
 	await expect(finishClaudeBridgeReturn(callback, new AbortController().signal, { request: request as typeof jsonRequest, wait: vi.fn() })).rejects.toThrow("did not complete");
+});
+
+it("rejects a failed new exchange even when native status preserves an existing signed-in account", async () => {
+	let reads = 0;
+	const request = vi.fn(async (path: string) => path === LOGIN_CODE_PATH ? { ok: true } : status(++reads === 1 ? pending : {
+		status: "signed-in",
+		operationError: "fixture token exchange failed",
+		accounts: [{ id: "existing-account", expires: 9999999999999 }],
+		activeAccountId: "existing-account",
+	}));
+	await expect(finishClaudeBridgeReturn(callback, new AbortController().signal, { request: request as typeof jsonRequest, wait: vi.fn() })).rejects.toThrow("did not complete");
+	expect(request.mock.calls.filter(([path]) => path === LOGIN_CODE_PATH)).toHaveLength(1);
+});
+
+it.each([
+	{ status: "signed-in", activeAccountId: "existing-account" },
+	{ status: "signed-in", activeAccountId: "existing-account", completedLoginAttemptId: "previous-attempt" },
+	{ ...pending, loginAttemptId: "replacement-attempt" },
+])("does not accept cancellation or a different attempt's status as this callback's completion", async (next) => {
+	let reads = 0;
+	const request = vi.fn(async (path: string) => path === LOGIN_CODE_PATH ? { ok: true } : status(++reads === 1 ? pending : next));
+	await expect(finishClaudeBridgeReturn(callback, new AbortController().signal, { request: request as typeof jsonRequest, wait: vi.fn() })).rejects.toThrow("did not complete");
+	expect(request.mock.calls.filter(([path]) => path === LOGIN_CODE_PATH)).toHaveLength(1);
 });
 
 it("bounds polling and stops without resubmitting a code when canceled", async () => {

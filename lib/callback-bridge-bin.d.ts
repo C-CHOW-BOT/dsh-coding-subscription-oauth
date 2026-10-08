@@ -5,6 +5,7 @@ export declare const BRIDGE_LAUNCH_AGENT_LABEL = "io.dsh.claude-callback-bridge"
 export interface BridgeRunConfig {
     remoteOrigin: string;
     target: BridgeTarget;
+    configurationId?: string;
 }
 export interface BridgeCliConfig {
     remoteOrigin: string;
@@ -43,7 +44,12 @@ export interface BridgeCliDependencies {
     removeAgent(path: string): Promise<void>;
     launchctl(args: string[]): Promise<number>;
     exec(command: string, args: string[]): Promise<string>;
+    probeHealth(timeoutMs: number): Promise<unknown>;
+    wait(milliseconds: number): Promise<void>;
+    now(): number;
 }
+/** Fingerprint the original configured transport, including unresolved automatic targets. */
+export declare function bridgeConfigurationId(config: BridgeCliConfig): string;
 export declare function parseBridgeArguments(args: readonly string[]): BridgeCliCommand;
 export declare function bridgeRunArguments(config: BridgeCliConfig): string[];
 export declare function bridgeLaunchAgentPlist(config: BridgeCliConfig, nodeExecutable: string, binPath: string, executableSearchPath: string): string;

@@ -2,8 +2,10 @@
 /** Local Claude callback bridge CLI; this entry has no DSH runtime dependencies. */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, unlink } from "node:fs/promises";
+import { request } from "node:http";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,10 +14,16 @@ import { type BridgeTarget, startCallbackBridge } from "./callback-bridge.ts";
 export const BRIDGE_LAUNCH_AGENT_LABEL = "io.dsh.claude-callback-bridge";
 const AGENT_MARKER = "<!-- Managed by dsh-claude-bridge; schema=1 -->";
 const XML_HEADER = '<?xml version="1.0" encoding="UTF-8"?>';
+const INSTALL_READY_TIMEOUT_MS = 5_000;
+
+function safeGcpName(value: string): boolean {
+	return /^[a-z][a-z0-9-]{0,62}$/u.test(value);
+}
 
 export interface BridgeRunConfig {
 	remoteOrigin: string;
 	target: BridgeTarget;
+	configurationId?: string;
 }
 
 export interface BridgeCliConfig {
@@ -46,6 +54,21 @@ export interface BridgeCliDependencies {
 	removeAgent(path: string): Promise<void>;
 	launchctl(args: string[]): Promise<number>;
 	exec(command: string, args: string[]): Promise<string>;
+	probeHealth(timeoutMs: number): Promise<unknown>;
+	wait(milliseconds: number): Promise<void>;
+	now(): number;
+}
+
+/** Fingerprint the original configured transport, including unresolved automatic targets. */
+export function bridgeConfigurationId(config: BridgeCliConfig): string {
+	const target = config.target;
+	const identity =
+		target.kind === "browser"
+			? [config.remoteOrigin, target.kind]
+			: target.kind === "ssh"
+				? [config.remoteOrigin, target.kind, target.host]
+				: [config.remoteOrigin, target.kind, target.instance, target.project, target.zone ?? null];
+	return createHash("sha256").update(JSON.stringify(identity)).digest("hex");
 }
 
 export function parseBridgeArguments(args: readonly string[]): BridgeCliCommand {
@@ -110,8 +133,8 @@ export function parseBridgeArguments(args: readonly string[]): BridgeCliCommand 
 		if (instance === undefined || project === undefined || (zone === undefined && instance !== "auto")) {
 			throw new Error("provide --ssh-host or all of --gcp-instance, --gcp-project, and --gcp-zone");
 		}
-		if (![instance, project, ...(zone === undefined ? [] : [zone])].every(safeName)) {
-			throw new Error("GCP identifiers must be plain names");
+		if (![instance, project, ...(zone === undefined ? [] : [zone])].every(safeGcpName)) {
+			throw new Error("GCP identifiers must be lowercase plain names starting with a letter");
 		}
 		if (instance === "auto") target = { kind: "gcp", instance, project, ...(zone === undefined ? {} : { zone }) };
 		else target = { kind: "gcp", instance, project, zone: zone! };
@@ -204,7 +227,46 @@ async function installBridge(config: BridgeCliConfig, dependencies: BridgeCliDep
 	if ((await dependencies.launchctl(["kickstart", location.service])) !== 0) {
 		throw new Error("macOS could not start the bridge LaunchAgent; retry install or use run");
 	}
+	await verifyInstalledBridge(config, dependencies);
 	dependencies.stdout("Bridge installed for your macOS user and started. It starts again when you log in.\n");
+}
+
+async function verifyInstalledBridge(config: BridgeCliConfig, dependencies: BridgeCliDependencies): Promise<void> {
+	const configurationId = bridgeConfigurationId(config);
+	const deadline = dependencies.now() + INSTALL_READY_TIMEOUT_MS;
+	while (dependencies.now() < deadline) {
+		let health: unknown;
+		const timeoutMs = Math.min(500, deadline - dependencies.now());
+		if (timeoutMs <= 0) break;
+		try {
+			health = await dependencies.probeHealth(timeoutMs);
+		} catch {
+			// Startup and connection errors must not expose private configuration or response contents.
+		}
+		if (dependencies.now() >= deadline) break;
+		if (health !== undefined) {
+			if (
+				typeof health === "object" &&
+				health !== null &&
+				"service" in health &&
+				health.service === "dsh-claude-bridge" &&
+				"protocol" in health &&
+				health.protocol === 1 &&
+				"configurationId" in health &&
+				health.configurationId === configurationId
+			) {
+				return;
+			}
+			throw new Error(
+				"The local bridge service does not match this installation. Run dsh-claude-bridge uninstall, then install the intended configuration again; stop any separate foreground helper first",
+			);
+		}
+		const remaining = deadline - dependencies.now();
+		if (remaining > 0) await dependencies.wait(Math.min(100, remaining));
+	}
+	throw new Error(
+		"The installed bridge did not become ready within five seconds. Run dsh-claude-bridge uninstall, then install again; use run to diagnose startup and stop any separate foreground helper first",
+	);
 }
 
 async function uninstallBridge(dependencies: BridgeCliDependencies): Promise<void> {
@@ -282,12 +344,7 @@ export async function resolveBridgeRunConfig(
 		throw new Error("The owned devbox is not running; start it before retrying sign-in");
 	const instance = selected["name"];
 	const zone = typeof selected["zone"] === "string" ? selected["zone"].split("/").at(-1) : undefined;
-	if (
-		typeof instance !== "string" ||
-		!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,252}$/u.test(instance) ||
-		zone === undefined ||
-		!/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,252}$/u.test(zone)
-	) {
+	if (typeof instance !== "string" || !safeGcpName(instance) || zone === undefined || !safeGcpName(zone)) {
 		throw new Error("GCP target discovery returned an invalid instance; specify an explicit instance and zone");
 	}
 	if (target.zone !== undefined && target.zone !== zone)
@@ -303,7 +360,10 @@ async function runBridge(config: BridgeCliConfig, dependencies: BridgeCliDepende
 	dependencies.onSignal("SIGINT", stop);
 	dependencies.onSignal("SIGTERM", stop);
 	try {
-		const bridge = await dependencies.start(await resolveBridgeRunConfig(config, dependencies));
+		const bridge = await dependencies.start({
+			...(await resolveBridgeRunConfig(config, dependencies)),
+			configurationId: bridgeConfigurationId(config),
+		});
 		try {
 			dependencies.stdout(
 				`Claude callback bridge ready: ${bridge.url}\nKeep this process running while you sign in.\n`,
@@ -374,6 +434,53 @@ export function defaultBridgeCliDependencies(): BridgeCliDependencies {
 		},
 		secureAgent: (path) => chmod(path, 0o600),
 		removeAgent: (path) => unlink(path),
+		probeHealth: (timeoutMs) =>
+			new Promise<unknown>((resolve) => {
+				let completed = false;
+				const finish = (health?: unknown): void => {
+					if (completed) return;
+					completed = true;
+					clearTimeout(timer);
+					resolve(health);
+				};
+				const probe = request(
+					{
+						hostname: "127.0.0.1",
+						port: 53700,
+						path: "/health",
+						method: "GET",
+						headers: { accept: "application/json" },
+					},
+					(response) => {
+						let bytes = 0;
+						let body = "";
+						response.setEncoding("utf8");
+						response.on("data", (chunk: string) => {
+							bytes += Buffer.byteLength(chunk);
+							if (bytes > 4096) {
+								finish(null);
+								probe.destroy();
+							} else body += chunk;
+						});
+						response.once("error", () => finish());
+						response.once("end", () => {
+							try {
+								finish(response.statusCode === 200 ? (JSON.parse(body) as unknown) : null);
+							} catch {
+								finish(null);
+							}
+						});
+					},
+				);
+				const timer = setTimeout(() => {
+					finish();
+					probe.destroy();
+				}, timeoutMs);
+				probe.once("error", () => finish());
+				probe.end();
+			}),
+		wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
+		now: () => performance.now(),
 		launchctl: (args) =>
 			new Promise<number>((resolve, reject) => {
 				const child = spawn("/bin/launchctl", args, { stdio: "ignore", shell: false });

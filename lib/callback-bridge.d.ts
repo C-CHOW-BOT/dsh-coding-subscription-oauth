@@ -14,6 +14,8 @@ type TunnelProcess = Pick<ChildProcess, "once" | "removeListener" | "kill" | "pi
 export interface CallbackBridgeOptions {
     target: BridgeTarget;
     remoteOrigin: string;
+    /** Non-secret configuration fingerprint supplied by the CLI before optional target discovery. */
+    configurationId?: string;
     /** Dependency injection for isolated tests. The installed CLI never accepts these options. */
     _test?: {
         controlPort?: number;

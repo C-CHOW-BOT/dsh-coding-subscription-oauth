@@ -23,7 +23,7 @@ interface ReturnDependencies {
 	wait: (signal: AbortSignal) => Promise<void>;
 }
 
-/** Submission queues the native OAuth prompt; persisted provider status alone confirms completion. */
+/** Submission queues the native OAuth prompt; only this attempt's persisted receipt confirms completion. */
 export async function finishClaudeBridgeReturn(
 	callback: string,
 	signal: AbortSignal,
@@ -48,9 +48,12 @@ export async function finishClaudeBridgeReturn(
 	if (!callback || callback.length > 8192 || signal.aborted) throw new Error("Invalid callback.");
 	const initial = await dependencies.request<CodingOAuthStatus>(STATUS_PATH, "GET", undefined, signal);
 	const pending = initial.providers.claude;
+	const attemptId = pending.loginAttemptId;
 	if (
 		pending.status !== "signing-in" ||
 		pending.method !== "browser" ||
+		typeof attemptId !== "string" ||
+		attemptId.length === 0 ||
 		!isMatchingClaudeCallback(callback, pending.url)
 	) {
 		throw new Error("This callback does not match a pending Claude sign-in.");
@@ -61,10 +64,14 @@ export async function finishClaudeBridgeReturn(
 		if (signal.aborted) throw new Error("Sign-in stopped.");
 		const status = (await dependencies.request<CodingOAuthStatus>(STATUS_PATH, "GET", undefined, signal)).providers
 			.claude;
-		if (status.status === "signed-in") return;
+		// Native status preserves an existing account after a failed new login.
+		// That stored account must not turn this callback's failure into success.
+		if (status.operationError) throw new Error("Sign-in did not complete.");
+		if (status.status === "signed-in" && status.completedLoginAttemptId === attemptId) return;
 		if (
 			status.status !== "signing-in" ||
 			status.method !== "browser" ||
+			status.loginAttemptId !== attemptId ||
 			!isMatchingClaudeCallback(callback, status.url)
 		) {
 			throw new Error("Sign-in did not complete.");
