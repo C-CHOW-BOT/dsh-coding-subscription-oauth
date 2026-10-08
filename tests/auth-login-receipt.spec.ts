@@ -6,7 +6,12 @@ import { PassThrough, Readable } from "node:stream";
 import type { Context } from "@deepseek-ai/cordis";
 import type { AuthInteraction } from "@earendil-works/pi-ai";
 import { expect, it, vi } from "vitest";
-import { CODING_OAUTH_LOGIN_PATH, registerCodingOAuthRoutes, SubscriptionWebAuth } from "../src/auth-routes.ts";
+import {
+	CODING_OAUTH_LOGIN_PATH,
+	CODING_OAUTH_LOGOUT_PATH,
+	registerCodingOAuthRoutes,
+	SubscriptionWebAuth,
+} from "../src/auth-routes.ts";
 import { OAUTH_PROVIDER_DEFINITIONS } from "../src/oauth-providers.ts";
 import { OAuthProviderSession } from "../src/oauth-session.ts";
 import { OAuthCredentialFileStore } from "../src/store.ts";
@@ -103,6 +108,7 @@ async function nativeLogoutFixture(slug: "claude" | "codex" = "claude") {
 	};
 	const session = new OAuthProviderSession(definition, undefined, store, join(directory, "models.json"));
 	const auth = new SubscriptionWebAuth(session);
+	const replacements: SubscriptionWebAuth[] = [];
 	let release: () => void = () => undefined;
 	let fail: (error: Error) => void = () => undefined;
 	let entered: () => void = () => undefined;
@@ -126,13 +132,160 @@ async function nativeLogoutFixture(slug: "claude" | "codex" = "claude") {
 		deletionEntered,
 		release: () => release(),
 		fail: () => fail(new Error("Fixture credential deletion failed")),
+		replacement: () => {
+			const replacement = new SubscriptionWebAuth(
+				new OAuthProviderSession(
+					definition,
+					undefined,
+					new OAuthCredentialFileStore(base.nativeProviderId, store.filename, base.route),
+					join(directory, "replacement-models.json"),
+				),
+			);
+			replacements.push(replacement);
+			return replacement;
+		},
 		close: async () => {
 			release();
-			await auth.dispose();
+			await Promise.all([auth.dispose(), ...replacements.map((replacement) => replacement.dispose())]);
 			await rm(directory, { recursive: true, force: true });
 		},
 	};
 }
+
+function delayedNativeWrite(session: OAuthProviderSession) {
+	let release: () => void = () => undefined;
+	let fail: (error: Error) => void = () => undefined;
+	let entered: () => void = () => undefined;
+	const writing = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	const wait = new Promise<void>((resolve, reject) => {
+		release = resolve;
+		fail = reject;
+	});
+	const modify = session.store.modify.bind(session.store);
+	const mutation = vi.spyOn(session.store, "modify").mockImplementation((providerId, fn) =>
+		modify(providerId, async (current) => {
+			const credential = await fn(current);
+			entered();
+			await wait;
+			return credential;
+		}),
+	);
+	return { writing, release: () => release(), fail: () => fail(new Error("Fixture write failed")), mutation };
+}
+
+it.each(["complete", "fail"] as const)(
+	"rejects a retry of an aborted Claude challenge while its native credential write drains (%s)",
+	async (outcome) => {
+		const f = await nativeLogoutFixture();
+		const write = delayedNativeWrite(f.session);
+		let canceled: Promise<void> | undefined;
+		try {
+			await f.auth.signIn("browser");
+			const first = (await f.auth.status()).loginAttemptId;
+			await f.auth.submitCode("fixture-code", first);
+			await write.writing;
+			canceled = f.auth.cancel();
+			await expect(f.auth.signIn("browser")).rejects.toThrow(
+				"sign-in cancellation is still completing; retry when it finishes",
+			);
+			expect((await f.auth.status()).loginAttemptId).toBe(first);
+			expect(write.mutation).toHaveBeenCalledOnce();
+			if (outcome === "complete") write.release();
+			else write.fail();
+			await canceled;
+			expect(await f.auth.status()).not.toHaveProperty("completedLoginAttemptId");
+			write.mutation.mockRestore();
+			await f.auth.signIn("browser");
+			const current = (await f.auth.status()).loginAttemptId;
+			expect(current).not.toBe(first);
+			await f.auth.submitCode("fresh-fixture-code", current);
+			await vi.waitFor(async () =>
+				expect(await f.auth.status()).toMatchObject({ status: "signed-in", completedLoginAttemptId: current }),
+			);
+		} finally {
+			write.release();
+			await canceled;
+			write.mutation.mockRestore();
+			await f.close();
+		}
+	},
+);
+
+it("rejects concurrent method retries while the original native operation drains cancellation", async () => {
+	const f = await nativeLogoutFixture("codex");
+	const write = delayedNativeWrite(f.session);
+	let switched: ReturnType<SubscriptionWebAuth["signIn"]> | undefined;
+	try {
+		await f.auth.signIn("browser");
+		const first = (await f.auth.status()).loginAttemptId;
+		await f.auth.submitCode("fixture-code", first);
+		await write.writing;
+		switched = f.auth.signIn("device");
+		for (const method of ["browser", "device"] as const)
+			await expect(f.auth.signIn(method)).rejects.toThrow("sign-in cancellation is still completing");
+		write.release();
+		const challenge = await switched;
+		expect(challenge.method).toBe("device");
+		expect(await f.auth.status()).toMatchObject({ status: "signing-in", method: "device", url: challenge.url });
+		expect((await f.auth.status()).loginAttemptId).not.toBe(first);
+		expect(await f.auth.status()).not.toHaveProperty("completedLoginAttemptId");
+	} finally {
+		write.release();
+		await switched;
+		write.mutation.mockRestore();
+		await f.close();
+	}
+});
+
+it.each(["complete", "fail"] as const)(
+	"drains an old owner's native logout before repeated disposal returns and replacement login persists (%s)",
+	async (outcome) => {
+		const f = await nativeLogoutFixture();
+		const signingOut = f.auth.signOut().then(
+			() => undefined,
+			(error: unknown) => error,
+		);
+		let disposal: Promise<void> | undefined;
+		let repeated: Promise<void> | undefined;
+		try {
+			await f.deletionEntered;
+			let settled = false;
+			disposal = f.auth.dispose().then(() => {
+				settled = true;
+			});
+			repeated = f.auth.dispose();
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(settled).toBe(false);
+			await expect(f.auth.signIn("browser")).rejects.toThrow("plugin disposed");
+			if (outcome === "complete") f.release();
+			else f.fail();
+			await Promise.all([disposal, repeated]);
+			const logoutResult = await signingOut;
+			if (outcome === "complete") expect(logoutResult).toBeUndefined();
+			else expect(logoutResult).toBeInstanceOf(Error);
+			expect(f.deletion).toHaveBeenCalledOnce();
+			const replacement = f.replacement();
+			await replacement.signIn("browser");
+			const attempt = (await replacement.status()).loginAttemptId;
+			await replacement.submitCode("fresh-fixture-code", attempt);
+			await vi.waitFor(async () =>
+				expect(await replacement.status()).toMatchObject({ status: "signed-in", completedLoginAttemptId: attempt }),
+			);
+			const accounts = await replacement.session.store.listAccounts();
+			expect(accounts).toHaveLength(outcome === "complete" ? 1 : 2);
+			const credentials = await Promise.all(
+				accounts.map((account) => replacement.session.store.readAccount(account.id)),
+			);
+			expect(credentials).toContainEqual(expect.objectContaining({ access: "fixture-new-access" }));
+		} finally {
+			f.release();
+			await Promise.all([signingOut, disposal, repeated]);
+			await f.close();
+		}
+	},
+);
 
 function registeredLoginFixture(session: OAuthProviderSession) {
 	type RouteHandler = (request: IncomingMessage, response: ServerResponse) => void | Promise<void>;
@@ -278,6 +431,56 @@ it("rejects an accepted partial-body login request after its native route owner 
 		await pending;
 		await route.dispose();
 		login.mockRestore();
+		await f.close();
+	}
+});
+
+it("rejects an accepted partial-body logout after disposal without deleting replacement credentials", async () => {
+	const f = await nativeLogoutFixture();
+	const route = registeredLoginFixture(f.session);
+	const logout = route.routes.get(CODING_OAUTH_LOGOUT_PATH)!;
+	const request = new PassThrough();
+	Object.assign(request, {
+		method: "POST",
+		headers: { host: "127.0.0.1:3080" },
+		socket: { remoteAddress: "127.0.0.1" },
+	});
+	let status = 0;
+	let body = "";
+	const pending = logout(
+		request as unknown as IncomingMessage,
+		{
+			writeHead: (value: number) => {
+				status = value;
+			},
+			end: (value: string) => {
+				body = value;
+			},
+		} as unknown as ServerResponse,
+	);
+	try {
+		const reading = new Promise<void>((resolve) => request.once("data", () => resolve()));
+		request.write('{"provider":');
+		await reading;
+		await route.dispose();
+		const replacement = f.replacement();
+		await replacement.signIn("browser");
+		const attempt = (await replacement.status()).loginAttemptId;
+		await replacement.submitCode("fresh-fixture-code", attempt);
+		await vi.waitFor(async () =>
+			expect(await replacement.status()).toMatchObject({ status: "signed-in", completedLoginAttemptId: attempt }),
+		);
+		request.end('"claude"}');
+		await pending;
+		expect(status).toBe(409);
+		expect(JSON.parse(body)).toEqual({ error: "claude-code-oauth: plugin disposed; reload after it is available" });
+		expect(f.deletion).not.toHaveBeenCalled();
+		expect(await replacement.session.store.listAccounts()).toHaveLength(2);
+		expect(await replacement.status()).toMatchObject({ status: "signed-in", completedLoginAttemptId: attempt });
+	} finally {
+		request.end();
+		await pending;
+		await route.dispose();
 		await f.close();
 	}
 });

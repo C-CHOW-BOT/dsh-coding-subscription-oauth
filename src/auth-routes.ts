@@ -562,6 +562,12 @@ export class SubscriptionWebAuth {
 
 	signOut(): Promise<void> {
 		if (this.signOutOperation !== undefined) return this.signOutOperation;
+		if (this.disposed)
+			return Promise.reject(
+				new SubscriptionLoginConflictError(
+					`${this.session.definition.route}: plugin disposed; reload after it is available`,
+				),
+			);
 		this.signOutOperation = (async () => {
 			this.cancellation?.abort(new Error(`${this.session.definition.route}: sign-in cancelled`));
 			await this.operation?.catch(() => undefined);
@@ -586,12 +592,17 @@ export class SubscriptionWebAuth {
 			throw new SubscriptionLoginConflictError(
 				`${this.session.definition.route}: sign-out is still completing; retry when it finishes`,
 			);
+		if (this.operation !== undefined && this.cancellation?.signal.aborted)
+			throw new SubscriptionLoginConflictError(
+				`${this.session.definition.route}: sign-in cancellation is still completing; retry when it finishes`,
+			);
 	}
 
 	async dispose(): Promise<void> {
 		this.disposed = true;
 		this.cancellation?.abort(new Error(`${this.session.definition.route}: plugin disposed`));
 		await this.operation?.catch(() => undefined);
+		await this.signOutOperation?.catch(() => undefined);
 		this.lastLoginError = undefined;
 		this.completedLoginAttemptId = undefined;
 		this.codeResolver = undefined;
@@ -1091,7 +1102,9 @@ export function registerCodingOAuthRoutes(
 						else await subscription(slug).signOut();
 						json(res, 200, await allStatus(decision.accessMode));
 					} catch (error: unknown) {
-						json(res, requestErrorStatus(error, 500), { error: safeMessage(error) });
+						json(res, requestErrorStatus(error, error instanceof SubscriptionLoginConflictError ? 409 : 500), {
+							error: safeMessage(error),
+						});
 					}
 				},
 			}),

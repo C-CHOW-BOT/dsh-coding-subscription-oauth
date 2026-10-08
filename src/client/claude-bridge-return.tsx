@@ -56,8 +56,31 @@ export async function finishClaudeBridgeReturn(
 	},
 ): Promise<void> {
 	if (!callback || callback.length > 8192 || signal.aborted) throw new Error("Invalid callback.");
-	const initial = await dependencies.request<CodingOAuthStatus>(STATUS_PATH, "GET", undefined, signal);
-	const pending = initial.providers.claude;
+	let reads = 0;
+	const readStatus = async () => {
+		if (reads >= RETURN_POLL_ATTEMPTS) throw new ClaudeBridgeReturnTimeoutError();
+		reads += 1;
+		return (await dependencies.request<CodingOAuthStatus>(STATUS_PATH, "GET", undefined, signal)).providers.claude;
+	};
+	const retryStatusError = (error: unknown) => {
+		if (
+			signal.aborted ||
+			error instanceof ClaudeBridgeReturnTimeoutError ||
+			(isPluginRequestError(error) && error.status < 500)
+		)
+			throw error;
+		return dependencies.wait(signal);
+	};
+	let pending: CodingOAuthStatus["providers"]["claude"];
+	for (;;) {
+		if (signal.aborted) throw new Error("Sign-in stopped.");
+		try {
+			pending = await readStatus();
+			break;
+		} catch (error) {
+			await retryStatusError(error);
+		}
+	}
 	const attemptId = pending.loginAttemptId;
 	if (
 		pending.status !== "signing-in" ||
@@ -77,18 +100,17 @@ export async function finishClaudeBridgeReturn(
 			signal,
 		);
 	} catch (error) {
-		if (signal.aborted || isPluginRequestError(error)) throw error;
-		// A lost acknowledgement can follow an accepted callback. Observe its
-		// receipt without ever submitting the authorization code a second time.
+		if (signal.aborted || (isPluginRequestError(error) && error.status !== 409 && error.status < 500)) throw error;
+		// Transport/server failures may follow acceptance, and another page may
+		// have delivered this attempt first. Observe only its receipt; never repost.
 	}
-	for (let attempt = 0; attempt < RETURN_POLL_ATTEMPTS; attempt += 1) {
+	for (;;) {
 		if (signal.aborted) throw new Error("Sign-in stopped.");
 		let status: CodingOAuthStatus["providers"]["claude"];
 		try {
-			status = (await dependencies.request<CodingOAuthStatus>(STATUS_PATH, "GET", undefined, signal)).providers.claude;
+			status = await readStatus();
 		} catch (error) {
-			if (signal.aborted) throw error;
-			await dependencies.wait(signal);
+			await retryStatusError(error);
 			continue;
 		}
 		// Native status preserves an existing account after a failed new login.
@@ -105,7 +127,6 @@ export async function finishClaudeBridgeReturn(
 		}
 		await dependencies.wait(signal);
 	}
-	throw new ClaudeBridgeReturnTimeoutError();
 }
 
 type ReturnState = "pending" | "success" | "failure" | "unconfirmed";

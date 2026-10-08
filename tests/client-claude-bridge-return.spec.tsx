@@ -154,7 +154,7 @@ it("bounds polling and stops without resubmitting a code when canceled", async (
 });
 
 it("renders generic recovery text without reflecting callback codes or provider errors", async () => {
-	mocks.request.mockRejectedValue(new Error(`upstream error ${callback}`));
+	mocks.request.mockRejectedValue(Object.assign(new Error(`upstream error ${callback}`), { name: "PluginRequestError", status: 403 }));
 	cleanups.push(mountClaudeBridgeReturn(callback, (key) => en[key]));
 	await waitFor(() => expect(document.body.textContent).toContain(en.bridgeReturnFailure));
 	expect(document.body.textContent).not.toContain("fixture-code");
@@ -262,7 +262,7 @@ it("does not observe or resubmit after the API definitively rejects the callback
 	const request = mocks.request.getMockImplementation()!;
 	mocks.request.mockImplementation(async (...args) => {
 		if (args[0] === LOGIN_CODE_PATH) {
-			throw Object.assign(new Error("fixture callback rejected"), { name: "PluginRequestError", status: 409 });
+			throw Object.assign(new Error("fixture callback rejected"), { name: "PluginRequestError", status: 403 });
 		}
 		return request(...args);
 	});
@@ -342,7 +342,7 @@ it("contains keyboard focus while pending, focuses recovery, and restores backgr
 			expect(event.defaultPrevented).toBe(true);
 			expect(document.activeElement).toBe(dialog);
 		}
-		await act(async () => { failRequest(new Error("fixture failure")); });
+		await act(async () => { failRequest(Object.assign(new Error("fixture failure"), { name: "PluginRequestError", status: 403 })); });
 		const close = dialog.querySelector<HTMLButtonElement>("button")!;
 		expect(document.activeElement).toBe(close);
 		for (const shiftKey of [false, true]) {

@@ -60,7 +60,7 @@ Replace `VERSION` with the reviewed package version and use your DSH origin. Inc
 
 The callback fragment stays in the browser and is not sent in the initial website HTTP request. DSH removes it after consuming it. The helper does not receive your DSH browser cookies or store Claude tokens.
 
-A received callback or a browser return does not prove that credential exchange and storage succeeded. Automatic completion requires signed-in status with a matching operation receipt and no operation error; an older account that remains signed in after failure or cancellation is insufficient. The DSH server and client must both support these receipts. The return page observes the matching login for up to 60 seconds. After a lost submission acknowledgement or temporary status-read failure, it continues observing the same attempt without submitting the callback again. If confirmation takes longer, it reports an unconfirmed result rather than an exchange failure; check the original DSH account status before starting another attempt. A pending helper attempt expires after five minutes; existing authenticated accounts are independent of a pending attempt.
+A received callback or a browser return does not prove that credential exchange and storage succeeded. Automatic completion requires signed-in status with a matching operation receipt and no operation error; an older account that remains signed in after failure or cancellation is insufficient. The DSH server and client must both support these receipts. The return page observes the matching login for up to 60 seconds. It retries transient status-read failures before submission and revalidates the pending challenge. After a lost or ambiguous submission acknowledgement, including a 5xx response or manual submission winning the race, it continues observing the same attempt without submitting the callback again. If confirmation takes longer, it reports an unconfirmed result rather than an exchange failure; check the original DSH account status before starting another attempt. A pending helper attempt expires after five minutes; existing authenticated accounts are independent of a pending attempt.
 
 ## Optional SSH or Google Cloud forwarding
 
@@ -97,6 +97,7 @@ Forwarding readiness is bounded to 30 seconds. Native callback HTTP `200` means 
 - **Optional SSH or IAP fails:** verify access interactively first, or reinstall the default origin-only mode. Google Cloud authentication and VM permissions are unnecessary for the default flow.
 - **Expired or canceled attempt:** start a fresh login and use its own authorization page. The local callback receiver has a bounded lifetime.
 - **Sign-out still completing:** wait for it to finish before starting another sign-in. A concurrent request receives a conflict and is not queued. If the plugin was disposed while a request was pending, reload DSH after the plugin is available before retrying.
+- **Sign-in cancellation still completing:** wait for native cancellation to finish before retrying. DSH rejects a concurrent retry instead of returning the canceled authorization page.
 - **Helper unavailable:** use the existing browser sign-in fallback. Copy the complete Claude callback address and paste it into DSH; DSH validates and submits it automatically.
 
 ## Remove the macOS background helper

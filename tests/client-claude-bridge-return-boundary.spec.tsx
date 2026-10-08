@@ -129,7 +129,7 @@ it("dismissal restores dynamically added background inert attributes and removes
 		});
 		expect(late.getAttribute("inert")).toBe("");
 		await act(async () => {
-			reject!(new Error("fixture rejection"));
+			reject!(Object.assign(new Error("fixture rejection"), { name: "PluginRequestError", status: 403 }));
 		});
 		const button = document.querySelector<HTMLButtonElement>('[role="dialog"] button')!;
 		expect(document.activeElement).toBe(button);
