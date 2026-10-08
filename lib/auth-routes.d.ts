@@ -119,6 +119,8 @@ export declare class SubscriptionWebAuth {
     private readonly challengeTimeoutMs;
     private state;
     private operation;
+    private signOutOperation;
+    private disposed;
     private lastLoginError;
     private loginAttemptId;
     private completedLoginAttemptId;
@@ -140,6 +142,7 @@ export declare class SubscriptionWebAuth {
     removeAccount(id: string): Promise<void>;
     private refreshStoredStateWhenIdle;
     signOut(): Promise<void>;
+    private requireLoginAvailable;
     dispose(): Promise<void>;
     private baseStatus;
     private readStoredStatus;

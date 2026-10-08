@@ -1,7 +1,15 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PassThrough, Readable } from "node:stream";
+import type { Context } from "@deepseek-ai/cordis";
 import type { AuthInteraction } from "@earendil-works/pi-ai";
 import { expect, it, vi } from "vitest";
-import { SubscriptionWebAuth } from "../src/auth-routes.ts";
+import { CODING_OAUTH_LOGIN_PATH, registerCodingOAuthRoutes, SubscriptionWebAuth } from "../src/auth-routes.ts";
 import { OAUTH_PROVIDER_DEFINITIONS } from "../src/oauth-providers.ts";
+import { OAuthProviderSession } from "../src/oauth-session.ts";
+import { OAuthCredentialFileStore } from "../src/store.ts";
 
 function fixture() {
 	let finish: () => void = () => undefined;
@@ -61,6 +69,286 @@ function fixture() {
 		},
 	};
 }
+
+async function nativeLogoutFixture(slug: "claude" | "codex" = "claude") {
+	const directory = await mkdtemp(join(tmpdir(), "dsh-oauth-login-lifecycle-"));
+	const base = OAUTH_PROVIDER_DEFINITIONS.find((definition) => definition.slug === slug)!;
+	const credential = {
+		type: "oauth" as const,
+		access: "fixture-access",
+		refresh: "fixture-refresh",
+		expires: Date.now() + 3_600_000,
+	};
+	const store = new OAuthCredentialFileStore(base.nativeProviderId, join(directory, "auth.json"), base.route);
+	await store.modify(base.nativeProviderId, async () => credential);
+	const definition = {
+		...base,
+		providerFactory: () => {
+			const provider = base.providerFactory();
+			return {
+				...provider,
+				auth: {
+					...provider.auth,
+					oauth: {
+						...provider.auth.oauth!,
+						login: async (interaction: AuthInteraction) => {
+							interaction.notify({ type: "auth_url", url: "https://claude.ai/oauth/authorize?state=fixture" });
+							await interaction.prompt({ type: "manual_code", message: "Enter fixture callback" });
+							return { ...credential, access: "fixture-new-access", refresh: "fixture-new-refresh" };
+						},
+					},
+				},
+			};
+		},
+	};
+	const session = new OAuthProviderSession(definition, undefined, store, join(directory, "models.json"));
+	const auth = new SubscriptionWebAuth(session);
+	let release: () => void = () => undefined;
+	let fail: (error: Error) => void = () => undefined;
+	let entered: () => void = () => undefined;
+	const deletionEntered = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	const deletionWait = new Promise<void>((resolve, reject) => {
+		release = resolve;
+		fail = reject;
+	});
+	const deleteCredential = store.delete.bind(store);
+	const deletion = vi.spyOn(store, "delete").mockImplementation(async (providerId) => {
+		entered();
+		await deletionWait;
+		await deleteCredential(providerId);
+	});
+	return {
+		auth,
+		session,
+		deletion,
+		deletionEntered,
+		release: () => release(),
+		fail: () => fail(new Error("Fixture credential deletion failed")),
+		close: async () => {
+			release();
+			await auth.dispose();
+			await rm(directory, { recursive: true, force: true });
+		},
+	};
+}
+
+function registeredLoginFixture(session: OAuthProviderSession) {
+	type RouteHandler = (request: IncomingMessage, response: ServerResponse) => void | Promise<void>;
+	const routes = new Map<string, RouteHandler>();
+	const cleanups: Array<() => void | Promise<void>> = [];
+	const context = {
+		webServer: {
+			register: (route: { path: string; handler: RouteHandler }) => {
+				routes.set(route.path, route.handler);
+				return () => routes.delete(route.path);
+			},
+		},
+		effect: (setup: () => void | (() => void | Promise<void>)) => {
+			const cleanup = setup();
+			if (typeof cleanup === "function") cleanups.push(cleanup);
+		},
+	} as unknown as Context;
+	registerCodingOAuthRoutes(context, {} as never, [session]);
+	let disposed = false;
+	return {
+		handler: routes.get(CODING_OAUTH_LOGIN_PATH)!,
+		routes,
+		dispose: async () => {
+			if (disposed) return;
+			disposed = true;
+			for (const cleanup of cleanups.reverse()) await cleanup();
+		},
+	};
+}
+
+it("rejects a new browser login until a coalesced native logout finishes, then preserves its persisted receipt", async () => {
+	const f = await nativeLogoutFixture();
+	const signingOut = f.auth.signOut();
+	let repeated: Promise<void> | undefined;
+	try {
+		await f.deletionEntered;
+		repeated = f.auth.signOut();
+		expect(f.deletion).toHaveBeenCalledOnce();
+		await expect(f.auth.signIn("browser")).rejects.toThrow("sign-out is still completing; retry when it finishes");
+		expect(await f.auth.status()).toMatchObject({ status: "signed-in" });
+		expect(await f.auth.status()).not.toHaveProperty("loginAttemptId");
+		expect(await f.auth.status()).not.toHaveProperty("completedLoginAttemptId");
+		f.release();
+		await Promise.all([signingOut, repeated]);
+		expect(await f.session.status()).toEqual({ authenticated: false });
+		const challenge = await f.auth.signIn("browser");
+		const pending = await f.auth.status();
+		expect(pending).toMatchObject({ status: "signing-in", url: challenge.url });
+		expect(pending.loginAttemptId).toEqual(expect.any(String));
+		await f.auth.submitCode("fixture-code", pending.loginAttemptId);
+		await vi.waitFor(async () =>
+			expect(await f.auth.status()).toMatchObject({
+				status: "signed-in",
+				completedLoginAttemptId: pending.loginAttemptId,
+			}),
+		);
+		expect(await f.session.storedCredential()).toMatchObject({ access: "fixture-new-access" });
+		expect(f.deletion).toHaveBeenCalledOnce();
+	} finally {
+		f.release();
+		await Promise.all([signingOut, repeated]);
+		await f.close();
+	}
+});
+
+it("returns a retryable HTTP conflict when native logout is still completing", async () => {
+	const f = await nativeLogoutFixture();
+	const signingOut = f.auth.signOut();
+	const signIn = f.auth.signIn.bind(f.auth);
+	const dispatch = vi.spyOn(SubscriptionWebAuth.prototype, "signIn").mockImplementation(signIn);
+	const route = registeredLoginFixture(f.session);
+	try {
+		await f.deletionEntered;
+		const request = Readable.from([JSON.stringify({ provider: "claude", method: "browser" })]);
+		Object.assign(request, {
+			method: "POST",
+			headers: { host: "127.0.0.1:3080" },
+			socket: { remoteAddress: "127.0.0.1" },
+		});
+		let status = 0;
+		let body = "";
+		await route.handler(
+			request as unknown as IncomingMessage,
+			{
+				writeHead: (value: number) => {
+					status = value;
+				},
+				end: (value: string) => {
+					body = value;
+				},
+			} as unknown as ServerResponse,
+		);
+		expect(status).toBe(409);
+		expect(JSON.parse(body)).toEqual({
+			error: "claude-code-oauth: sign-out is still completing; retry when it finishes",
+		});
+	} finally {
+		dispatch.mockRestore();
+		f.release();
+		await signingOut;
+		await route.dispose();
+		await f.close();
+	}
+});
+
+it("rejects an accepted partial-body login request after its native route owner is disposed", async () => {
+	const f = await nativeLogoutFixture();
+	const route = registeredLoginFixture(f.session);
+	const login = vi.spyOn(f.session, "login");
+	const request = new PassThrough();
+	Object.assign(request, {
+		method: "POST",
+		headers: { host: "127.0.0.1:3080" },
+		socket: { remoteAddress: "127.0.0.1" },
+	});
+	let status = 0;
+	let body = "";
+	const pending = route.handler(
+		request as unknown as IncomingMessage,
+		{
+			writeHead: (value: number) => {
+				status = value;
+			},
+			end: (value: string) => {
+				body = value;
+			},
+		} as unknown as ServerResponse,
+	);
+	try {
+		const reading = new Promise<void>((resolve) => request.once("data", () => resolve()));
+		request.write('{"provider":"claude",');
+		await reading;
+		await route.dispose();
+		expect(route.routes.size).toBe(0);
+		request.end('"method":"browser"}');
+		await pending;
+		expect(status).toBe(409);
+		expect(JSON.parse(body)).toEqual({ error: "claude-code-oauth: plugin disposed; reload after it is available" });
+		expect(login).not.toHaveBeenCalled();
+		expect(await f.session.storedCredential()).toMatchObject({ access: "fixture-access" });
+	} finally {
+		request.end();
+		await pending;
+		await route.dispose();
+		login.mockRestore();
+		await f.close();
+	}
+});
+
+it("releases the login conflict after native logout fails without creating a latent login", async () => {
+	const f = await nativeLogoutFixture();
+	const signingOut = f.auth.signOut();
+	const failure = expect(signingOut).rejects.toThrow("Credential store delete failed");
+	try {
+		await f.deletionEntered;
+		await expect(f.auth.signIn("browser")).rejects.toThrow("sign-out is still completing");
+		f.fail();
+		await failure;
+		expect(await f.auth.status()).toMatchObject({ status: "signed-in" });
+		expect(await f.auth.status()).not.toHaveProperty("loginAttemptId");
+		await f.auth.signIn("browser");
+		const attemptId = (await f.auth.status()).loginAttemptId;
+		await f.auth.submitCode("fixture-code", attemptId);
+		await vi.waitFor(async () =>
+			expect(await f.auth.status()).toMatchObject({ status: "signed-in", completedLoginAttemptId: attemptId }),
+		);
+		const accounts = await f.session.store.listAccounts();
+		expect(accounts).toHaveLength(2);
+		const credentials = await Promise.all(accounts.map((account) => f.session.store.readAccount(account.id)));
+		expect(credentials).toContainEqual(expect.objectContaining({ access: "fixture-new-access" }));
+	} finally {
+		f.release();
+		await failure;
+		await f.close();
+	}
+});
+
+it("rechecks an awaited method-switch cancellation when native logout begins before the new login starts", async () => {
+	const f = await nativeLogoutFixture("codex");
+	let releaseCancel: () => void = () => undefined;
+	let enteredCancel: () => void = () => undefined;
+	const cancelEntered = new Promise<void>((resolve) => {
+		enteredCancel = resolve;
+	});
+	const cancelWait = new Promise<void>((resolve) => {
+		releaseCancel = resolve;
+	});
+	const cancel = f.auth.cancel.bind(f.auth);
+	const delayedCancel = vi.spyOn(f.auth, "cancel").mockImplementation(async () => {
+		enteredCancel();
+		await cancelWait;
+		await cancel();
+	});
+	let signingOut: Promise<void> | undefined;
+	let switched: Promise<void> | undefined;
+	try {
+		await f.auth.signIn("browser");
+		switched = expect(f.auth.signIn("device")).rejects.toThrow("sign-out is still completing");
+		await cancelEntered;
+		signingOut = f.auth.signOut();
+		await f.deletionEntered;
+		releaseCancel();
+		await switched;
+		expect(await f.auth.status()).not.toHaveProperty("loginAttemptId");
+		expect(await f.auth.status()).not.toHaveProperty("completedLoginAttemptId");
+		f.release();
+		await signingOut;
+		expect(await f.session.status()).toEqual({ authenticated: false });
+	} finally {
+		releaseCancel();
+		f.release();
+		await Promise.all([switched, signingOut]);
+		delayedCancel.mockRestore();
+		await f.close();
+	}
+});
 
 it("issues a completion receipt only after the matching login persists, and resets it for retries", async () => {
 	const { auth, finish, next } = fixture();

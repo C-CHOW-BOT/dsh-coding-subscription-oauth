@@ -415,10 +415,14 @@ function optionForLoginMethod(
 	return prompt.options.find((option) => label.test(option.label))?.id ?? prompt.options[0]?.id ?? "";
 }
 
+class SubscriptionLoginConflictError extends Error {}
+
 /** Web lifecycle for one pi-ai subscription OAuth provider. */
 export class SubscriptionWebAuth {
 	private state: SubscriptionWebAuthStatus | undefined;
 	private operation: Promise<void> | undefined;
+	private signOutOperation: Promise<void> | undefined;
+	private disposed = false;
 	private lastLoginError: string | undefined;
 	private loginAttemptId: string | undefined;
 	private completedLoginAttemptId: string | undefined;
@@ -466,7 +470,11 @@ export class SubscriptionWebAuth {
 		if (!this.session.definition.loginMethods.includes(method)) {
 			throw new Error(`${this.session.definition.route}: login method "${method}" is not supported`);
 		}
-		if (this.operation !== undefined && this.method !== method) await this.cancel();
+		this.requireLoginAvailable();
+		if (this.operation !== undefined && this.method !== method) {
+			await this.cancel();
+			this.requireLoginAvailable();
+		}
 		if (
 			this.operation !== undefined &&
 			(this.loginPersist.mode !== persist.mode || this.loginPersist.targetAccountId !== persist.targetAccountId)
@@ -552,18 +560,36 @@ export class SubscriptionWebAuth {
 		if (this.operation === undefined && this.loginAttemptId === attemptId) this.state = stored;
 	}
 
-	async signOut(): Promise<void> {
-		this.cancellation?.abort(new Error(`${this.session.definition.route}: sign-in cancelled`));
-		await this.operation?.catch(() => undefined);
-		this.lastLoginError = undefined;
-		this.completedLoginAttemptId = undefined;
-		this.codeResolver = undefined;
-		await this.session.logout();
-		this.challenge = undefined;
-		this.state = await this.readStoredStatus();
+	signOut(): Promise<void> {
+		if (this.signOutOperation !== undefined) return this.signOutOperation;
+		this.signOutOperation = (async () => {
+			this.cancellation?.abort(new Error(`${this.session.definition.route}: sign-in cancelled`));
+			await this.operation?.catch(() => undefined);
+			this.lastLoginError = undefined;
+			this.completedLoginAttemptId = undefined;
+			this.codeResolver = undefined;
+			await this.session.logout();
+			this.challenge = undefined;
+			this.state = await this.readStoredStatus();
+		})().finally(() => {
+			this.signOutOperation = undefined;
+		});
+		return this.signOutOperation;
+	}
+
+	private requireLoginAvailable(): void {
+		if (this.disposed)
+			throw new SubscriptionLoginConflictError(
+				`${this.session.definition.route}: plugin disposed; reload after it is available`,
+			);
+		if (this.signOutOperation !== undefined)
+			throw new SubscriptionLoginConflictError(
+				`${this.session.definition.route}: sign-out is still completing; retry when it finishes`,
+			);
 	}
 
 	async dispose(): Promise<void> {
+		this.disposed = true;
 		this.cancellation?.abort(new Error(`${this.session.definition.route}: plugin disposed`));
 		await this.operation?.catch(() => undefined);
 		this.lastLoginError = undefined;
@@ -974,7 +1000,9 @@ export function registerCodingOAuthRoutes(
 								: auth.session.definition.recommendedLoginMethod;
 						json(res, 200, await auth.signIn(method, persist));
 					} catch (error: unknown) {
-						json(res, requestErrorStatus(error, 500), { error: safeMessage(error) });
+						json(res, requestErrorStatus(error, error instanceof SubscriptionLoginConflictError ? 409 : 500), {
+							error: safeMessage(error),
+						});
 					}
 				},
 			}),

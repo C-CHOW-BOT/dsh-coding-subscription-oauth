@@ -96,6 +96,7 @@ Forwarding readiness is bounded to 30 seconds. Native callback HTTP `200` means 
 - **Default browser return cannot complete:** remain signed in to the configured DSH website and retry a fresh attempt. Token exchange errors appear in DSH rather than being reported as a successful connection.
 - **Optional SSH or IAP fails:** verify access interactively first, or reinstall the default origin-only mode. Google Cloud authentication and VM permissions are unnecessary for the default flow.
 - **Expired or canceled attempt:** start a fresh login and use its own authorization page. The local callback receiver has a bounded lifetime.
+- **Sign-out still completing:** wait for it to finish before starting another sign-in. A concurrent request receives a conflict and is not queued. If the plugin was disposed while a request was pending, reload DSH after the plugin is available before retrying.
 - **Helper unavailable:** use the existing browser sign-in fallback. Copy the complete Claude callback address and paste it into DSH; DSH validates and submits it automatically.
 
 ## Remove the macOS background helper
