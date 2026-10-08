@@ -304,6 +304,50 @@ describe("per-user macOS bridge installer", () => {
 		expect(dependencies.stdout).toHaveBeenCalledWith(expect.stringContaining("installed"));
 	});
 
+	it.each(["matching health", "unrelated health"])(
+		"leaves a registered incumbent without an owned file unclaimed through install and uninstall: %s",
+		async (health) => {
+			const { dependencies, files, path } = fixture();
+			files.set("/example-home/Library/LaunchAgents/incumbent.plist", "incumbent configuration");
+			dependencies.launchctl = vi.fn(async () => 0);
+			if (health === "unrelated health") {
+				dependencies.probeHealth = vi.fn(async () => ({ service: "unrelated-service" }));
+			}
+			expect(await runCallbackBridgeCli(["install", ...SSH_ARGS], dependencies)).toBe(1);
+			expect(files.has(path)).toBe(false);
+			expect(dependencies.stderr).toHaveBeenCalledWith(expect.stringContaining("without an owned LaunchAgent file"));
+			expect(dependencies.writeAgent).not.toHaveBeenCalled();
+			expect(dependencies.secureAgent).not.toHaveBeenCalled();
+			expect(dependencies.probeHealth).not.toHaveBeenCalled();
+			expect(dependencies.stdout).not.toHaveBeenCalled();
+			expect(await runCallbackBridgeCli(["uninstall"], dependencies)).toBe(0);
+			expect(dependencies.launchctl).toHaveBeenCalledTimes(1);
+			expect(dependencies.launchctl).toHaveBeenCalledWith(["print", `gui/501/${BRIDGE_LAUNCH_AGENT_LABEL}`]);
+			expect(dependencies.removeAgent).not.toHaveBeenCalled();
+			expect([...files.entries()]).toEqual([
+				["/example-home/Library/LaunchAgents/incumbent.plist", "incumbent configuration"],
+			]);
+		},
+	);
+
+	it.each(["unreadable", "malformed"])(
+		"refuses installation before writing when registration verification is %s",
+		async (response) => {
+			const { dependencies, files } = fixture();
+			dependencies.launchctl = vi.fn(async () => {
+				if (response === "unreadable") throw new Error("private-registration-response");
+				return Number.NaN;
+			});
+			expect(await runCallbackBridgeCli(["install", ...SSH_ARGS], dependencies)).toBe(1);
+			expect(files.size).toBe(0);
+			expect(dependencies.launchctl).toHaveBeenCalledTimes(1);
+			expect(dependencies.writeAgent).not.toHaveBeenCalled();
+			expect(dependencies.probeHealth).not.toHaveBeenCalled();
+			expect(dependencies.stderr).toHaveBeenCalledWith(expect.stringContaining("Could not verify"));
+			expect(dependencies.stderr).not.toHaveBeenCalledWith(expect.stringContaining("private-registration-response"));
+		},
+	);
+
 	it("waits for matching local readiness before reporting success", async () => {
 		const { dependencies } = fixture();
 		const ready = await dependencies.probeHealth(500);

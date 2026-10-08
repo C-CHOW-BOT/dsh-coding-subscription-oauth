@@ -35,7 +35,7 @@ This starts a per-user LaunchAgent immediately and again when you log in. Before
 
 The file has mode `0600` and label `io.dsh.claude-callback-bridge`. It records absolute Node and CLI paths, connection arguments, and your executable `PATH`; it does not copy the rest of your environment or store account credentials.
 
-Repeating an identical installation is safe. A conflicting file or configuration is preserved. To change an owned installation, uninstall it and install the intended configuration. Do not overwrite an unrelated LaunchAgent. Starting the local helper does not require a DSH restart. On other systems, use the foreground `run` command.
+Repeating an identical installation is safe. A conflicting file or configuration is preserved. If macOS already has the service label registered without this helper's owned LaunchAgent file, installation refuses before creating a file or starting that service; inspect the existing registration first. To change an owned installation, uninstall it and install the intended configuration. Do not overwrite an unrelated LaunchAgent. Starting the local helper does not require a DSH restart. On other systems, use the foreground `run` command.
 
 ## Upgrade the macOS background helper
 
@@ -60,7 +60,7 @@ Replace `VERSION` with the reviewed package version and use your DSH origin. Inc
 
 The callback fragment stays in the browser and is not sent in the initial website HTTP request. DSH removes it after consuming it. The helper does not receive your DSH browser cookies or store Claude tokens.
 
-A received callback or a browser return does not prove that credential exchange and storage succeeded. Automatic completion requires signed-in status with a matching operation receipt and no operation error; an older account that remains signed in after failure or cancellation is insufficient. The DSH server and client must both support these receipts. A pending helper attempt expires after five minutes. Use a new DSH authorization attempt after a timeout or failure; existing authenticated accounts are independent of a pending attempt.
+A received callback or a browser return does not prove that credential exchange and storage succeeded. Automatic completion requires signed-in status with a matching operation receipt and no operation error; an older account that remains signed in after failure or cancellation is insufficient. The DSH server and client must both support these receipts. The return page observes the matching login for up to 60 seconds. After a lost submission acknowledgement or temporary status-read failure, it continues observing the same attempt without submitting the callback again. If confirmation takes longer, it reports an unconfirmed result rather than an exchange failure; check the original DSH account status before starting another attempt. A pending helper attempt expires after five minutes; existing authenticated accounts are independent of a pending attempt.
 
 ## Optional SSH or Google Cloud forwarding
 

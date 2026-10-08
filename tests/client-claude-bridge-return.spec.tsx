@@ -1,6 +1,8 @@
 /** @vitest-environment jsdom */
-import { waitFor } from "@testing-library/react";
+import { act, waitFor } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+import { SubscriptionWebAuth } from "../src/auth-routes.ts";
+import { CLAUDE_CODE_OAUTH_PROVIDER } from "../src/oauth-providers.ts";
 import { finishClaudeBridgeReturn, mountClaudeBridgeReturn, takeClaudeBridgeReturn } from "../src/client/claude-bridge-return.tsx";
 import type { jsonRequest } from "../src/client/api.ts";
 import { LOGIN_CODE_PATH, STATUS_PATH } from "../src/client/constants.ts";
@@ -14,7 +16,56 @@ const attemptId = "fixture-attempt";
 const pending = { status: "signing-in", method: "browser", url: challenge, loginAttemptId: attemptId };
 const status = (claude: unknown) => ({ providers: { claude } });
 const cleanups: Array<() => void> = [];
-afterEach(() => { for (const dispose of cleanups.splice(0)) dispose(); vi.restoreAllMocks(); mocks.request.mockReset(); window.history.replaceState(null, "", "/"); });
+afterEach(() => { for (const dispose of cleanups.splice(0)) dispose(); vi.useRealTimers(); vi.restoreAllMocks(); mocks.request.mockReset(); window.history.replaceState(null, "", "/"); });
+
+function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const abort = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", abort);
+			reject(signal?.reason);
+		};
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", abort);
+			resolve();
+		}, milliseconds);
+		signal?.addEventListener("abort", abort, { once: true });
+		if (signal?.aborted) abort();
+	});
+}
+
+function nativeReturnFixture(exchangeDelayMs: number, initialStatusDelayMs = 0) {
+	let authenticated = false;
+	const auth = new SubscriptionWebAuth({
+		definition: CLAUDE_CODE_OAUTH_PROVIDER,
+		availableModels: () => [], visibleModels: () => [], selectedModelIds: () => undefined,
+		status: async () => ({ authenticated }),
+		store: {
+			listAccounts: async () => [{ id: "fixture-account", expires: 9999999999999 }],
+			getActiveAccountId: async () => "fixture-account",
+		},
+		login: async (interaction: import("@earendil-works/pi-ai").AuthInteraction) => {
+			interaction.notify({ type: "auth_url", url: challenge });
+			await interaction.prompt({ type: "manual_code", message: "fixture" });
+			await delay(exchangeDelayMs, interaction.signal);
+			authenticated = true;
+		},
+	} as never);
+	let firstRead = true;
+	mocks.request.mockImplementation(async (path: string, _method: string, body: { code: string; loginAttemptId: string }, signal?: AbortSignal) => {
+		if (signal?.aborted) throw signal.reason;
+		if (path === LOGIN_CODE_PATH) {
+			await auth.submitCode(body.code, body.loginAttemptId);
+			return { ok: true };
+		}
+		if (firstRead) {
+			firstRead = false;
+			if (initialStatusDelayMs > 0) await delay(initialStatusDelayMs, signal);
+		}
+		return status(await auth.status());
+	});
+	return auth;
+}
 
 it("removes the callback fragment before any request and consumes it only once", () => {
 	window.history.replaceState({ fixture: true }, "", `/?session=fixture#${new URLSearchParams({ "dsh-claude-callback": callback })}`);
@@ -109,4 +160,205 @@ it("renders generic recovery text without reflecting callback codes or provider 
 	expect(document.body.textContent).not.toContain("fixture-code");
 	expect(document.body.textContent).not.toContain("pending-state");
 	expect(document.body.textContent).not.toContain(en.bridgeReturnSuccess);
+});
+
+it("keeps waiting through a valid slow native exchange after the initial status request", async () => {
+	vi.useFakeTimers();
+	const auth = nativeReturnFixture(29_000, 1500);
+	try {
+		await auth.signIn("browser");
+		const receipt = (await auth.status()).loginAttemptId;
+		cleanups.push(mountClaudeBridgeReturn(callback, (key) => en[key]));
+		await act(async () => { await vi.advanceTimersByTimeAsync(31_000); });
+		expect(await auth.status()).toMatchObject({ status: "signed-in", completedLoginAttemptId: receipt });
+		expect(document.body.textContent).toContain(en.bridgeReturnSuccess);
+		expect(document.body.textContent).not.toContain(en.bridgeReturnFailure);
+	} finally {
+		await auth.dispose();
+	}
+});
+
+it("leaves a late native receipt unconfirmed after the observation deadline, without claiming failure or success", async () => {
+	vi.useFakeTimers();
+	const auth = nativeReturnFixture(65_000);
+	try {
+		await auth.signIn("browser");
+		const receipt = (await auth.status()).loginAttemptId;
+		cleanups.push(mountClaudeBridgeReturn(callback, (key) => en[key]));
+		await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+		expect(document.body.textContent).toContain(en.bridgeReturnUnconfirmed);
+		expect(document.body.textContent).not.toContain(en.bridgeReturnFailure);
+		expect(document.body.textContent).not.toContain(en.bridgeReturnSuccess);
+		await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
+		expect(await auth.status()).toMatchObject({ status: "signed-in", completedLoginAttemptId: receipt });
+		expect(document.body.textContent).toContain(en.bridgeReturnUnconfirmed);
+		expect(document.body.textContent).not.toContain(en.bridgeReturnSuccess);
+		expect(document.body.textContent).not.toContain(en.bridgeReturnFailure);
+	} finally {
+		await auth.dispose();
+	}
+});
+
+it("stops observation on unmount while native persistence completes without a second callback submission", async () => {
+	vi.useFakeTimers();
+	const auth = nativeReturnFixture(5000);
+	let dispose: (() => void) | undefined;
+	try {
+		await auth.signIn("browser");
+		const receipt = (await auth.status()).loginAttemptId;
+		await act(async () => { dispose = mountClaudeBridgeReturn(callback, (key) => en[key]); });
+		expect(mocks.request.mock.calls.filter(([path]) => path === LOGIN_CODE_PATH)).toHaveLength(1);
+		const reads = mocks.request.mock.calls.length;
+		await act(async () => { dispose!(); dispose = undefined; });
+		await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+		expect(await auth.status()).toMatchObject({ status: "signed-in", completedLoginAttemptId: receipt });
+		expect(document.querySelector('[role="dialog"]')).toBeNull();
+		expect(mocks.request).toHaveBeenCalledTimes(reads);
+		expect(vi.getTimerCount()).toBe(0);
+	} finally {
+		dispose?.();
+		await auth.dispose();
+	}
+});
+
+it.each(["callback acknowledgement", "status observation"])("confirms the same native receipt after a lost %s response without resubmitting", async (phase) => {
+	vi.useFakeTimers();
+	const auth = nativeReturnFixture(1500);
+	const request = mocks.request.getMockImplementation()!;
+	let posted = false;
+	let failed = false;
+	mocks.request.mockImplementation(async (...args) => {
+		if (phase === "status observation" && posted && !failed && args[0] === STATUS_PATH) {
+			failed = true;
+			throw new TypeError("Failed to fetch");
+		}
+		const result = await request(...args);
+		if (args[0] === LOGIN_CODE_PATH) {
+			posted = true;
+			if (phase === "callback acknowledgement" && !failed) {
+				failed = true;
+				throw new TypeError("Failed to fetch");
+			}
+		}
+		return result;
+	});
+	try {
+		await auth.signIn("browser");
+		const receipt = (await auth.status()).loginAttemptId;
+		cleanups.push(mountClaudeBridgeReturn(callback, (key) => en[key]));
+		await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+		expect(await auth.status()).toMatchObject({ status: "signed-in", completedLoginAttemptId: receipt });
+		expect(document.body.textContent).toContain(en.bridgeReturnSuccess);
+		expect(document.body.textContent).not.toContain(en.bridgeReturnFailure);
+		expect(mocks.request.mock.calls.filter(([path]) => path === LOGIN_CODE_PATH)).toHaveLength(1);
+	} finally {
+		await auth.dispose();
+	}
+});
+
+it("does not observe or resubmit after the API definitively rejects the callback", async () => {
+	vi.useFakeTimers();
+	const auth = nativeReturnFixture(1500);
+	const request = mocks.request.getMockImplementation()!;
+	mocks.request.mockImplementation(async (...args) => {
+		if (args[0] === LOGIN_CODE_PATH) {
+			throw Object.assign(new Error("fixture callback rejected"), { name: "PluginRequestError", status: 409 });
+		}
+		return request(...args);
+	});
+	try {
+		await auth.signIn("browser");
+		cleanups.push(mountClaudeBridgeReturn(callback, (key) => en[key]));
+		await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
+		expect(document.body.textContent).toContain(en.bridgeReturnFailure);
+		expect(document.body.textContent).not.toContain(en.bridgeReturnUnconfirmed);
+		expect(mocks.request.mock.calls.filter(([path]) => path === STATUS_PATH)).toHaveLength(1);
+		expect(mocks.request.mock.calls.filter(([path]) => path === LOGIN_CODE_PATH)).toHaveLength(1);
+	} finally {
+		await auth.dispose();
+	}
+});
+
+it("reports unconfirmed when observation stays unavailable after native persistence", async () => {
+	vi.useFakeTimers();
+	const auth = nativeReturnFixture(1500);
+	const request = mocks.request.getMockImplementation()!;
+	let posted = false;
+	mocks.request.mockImplementation(async (...args) => {
+		if (posted && args[0] === STATUS_PATH) throw new TypeError("Failed to fetch");
+		const result = await request(...args);
+		if (args[0] === LOGIN_CODE_PATH) posted = true;
+		return result;
+	});
+	try {
+		await auth.signIn("browser");
+		const receipt = (await auth.status()).loginAttemptId;
+		cleanups.push(mountClaudeBridgeReturn(callback, (key) => en[key]));
+		await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+		expect(await auth.status()).toMatchObject({ status: "signed-in", completedLoginAttemptId: receipt });
+		expect(document.body.textContent).toContain(en.bridgeReturnUnconfirmed);
+		expect(document.body.textContent).not.toContain(en.bridgeReturnFailure);
+		expect(document.body.textContent).not.toContain(en.bridgeReturnSuccess);
+		expect(mocks.request.mock.calls.filter(([path]) => path === LOGIN_CODE_PATH)).toHaveLength(1);
+	} finally {
+		await auth.dispose();
+	}
+});
+
+it("bounds an unavailable initial status without submitting any callback", async () => {
+	vi.useFakeTimers();
+	const auth = nativeReturnFixture(1500, 65_000);
+	try {
+		await auth.signIn("browser");
+		cleanups.push(mountClaudeBridgeReturn(callback, (key) => en[key]));
+		await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+		expect(document.body.textContent).toContain(en.bridgeReturnUnconfirmed);
+		expect(mocks.request.mock.calls.filter(([path]) => path === LOGIN_CODE_PATH)).toHaveLength(0);
+	} finally {
+		await auth.dispose();
+	}
+});
+
+it("contains keyboard focus while pending, focuses recovery, and restores background focus on disposal", async () => {
+	const background = document.createElement("div");
+	const priorInert = document.createElement("div");
+	priorInert.setAttribute("inert", "existing-value");
+	const trigger = document.createElement("button");
+	trigger.textContent = "Background action";
+	background.append(trigger);
+	document.body.append(background, priorInert);
+	trigger.focus();
+	let failRequest: (error: Error) => void = () => undefined;
+	mocks.request.mockImplementation(async () => new Promise((_resolve, reject) => { failRequest = reject; }));
+	let dispose: (() => void) | undefined;
+	try {
+		await act(async () => { dispose = mountClaudeBridgeReturn(callback, (key) => en[key]); });
+		const dialog = document.querySelector<HTMLElement>('[role="dialog"]')!;
+		expect(document.activeElement).toBe(dialog);
+		expect(background.hasAttribute("inert")).toBe(true);
+		for (const shiftKey of [false, true]) {
+			const event = new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true });
+			dialog.dispatchEvent(event);
+			expect(event.defaultPrevented).toBe(true);
+			expect(document.activeElement).toBe(dialog);
+		}
+		await act(async () => { failRequest(new Error("fixture failure")); });
+		const close = dialog.querySelector<HTMLButtonElement>("button")!;
+		expect(document.activeElement).toBe(close);
+		for (const shiftKey of [false, true]) {
+			const event = new KeyboardEvent("keydown", { key: "Tab", shiftKey, bubbles: true, cancelable: true });
+			close.dispatchEvent(event);
+			expect(event.defaultPrevented).toBe(true);
+			expect(document.activeElement).toBe(close);
+		}
+		dispose!();
+		dispose = undefined;
+		expect(background.hasAttribute("inert")).toBe(false);
+		expect(priorInert.getAttribute("inert")).toBe("existing-value");
+		expect(document.activeElement).toBe(trigger);
+	} finally {
+		dispose?.();
+		background.remove();
+		priorInert.remove();
+	}
 });

@@ -217,9 +217,24 @@ async function installBridge(config: BridgeCliConfig, dependencies: BridgeCliDep
 			"LaunchAgent already exists with different contents; inspect it and uninstall the owned bridge before changing its configuration",
 		);
 	}
+	let loaded: boolean;
+	try {
+		const registrationStatus = await dependencies.launchctl(["print", location.service]);
+		if (!Number.isInteger(registrationStatus) || registrationStatus < 0 || registrationStatus > 255) {
+			throw new Error("Invalid registration response");
+		}
+		loaded = registrationStatus === 0;
+	} catch {
+		throw new Error("Could not verify the existing macOS bridge registration; installation left it unchanged");
+	}
+	if (existing === undefined && loaded) {
+		throw new Error(
+			"The macOS bridge service is already registered without an owned LaunchAgent file; inspect that existing service before installing",
+		);
+	}
 	if (existing === undefined) await dependencies.writeAgent(location.path, expected);
 	else await dependencies.secureAgent(location.path);
-	if ((await dependencies.launchctl(["print", location.service])) !== 0) {
+	if (!loaded) {
 		if ((await dependencies.launchctl(["bootstrap", location.domain, location.path])) !== 0) {
 			throw new Error("macOS could not load the bridge LaunchAgent; its owned file remains available for retry");
 		}

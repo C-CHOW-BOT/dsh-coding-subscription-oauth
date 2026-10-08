@@ -64,6 +64,9 @@ export const en = {
 	bridgeReturnPendingHint: "DSH is verifying the authorization and saving your account. Keep this page open.",
 	bridgeReturnFailure: "Claude sign-in did not complete",
 	bridgeReturnFailureHint: "Return to the original DSH Settings page to check the account and retry sign-in.",
+	bridgeReturnUnconfirmed: "Sign-in result not yet confirmed",
+	bridgeReturnUnconfirmedHint:
+		"This page could not confirm the result in time. Check the original DSH Settings page before starting another sign-in.",
 	bridgeReturnClose: "Close this page",
 	signedIn: "Signed in",
 	requestFailed: "The account request failed.",
@@ -455,6 +458,9 @@ export const zh: { [Key in GrokBuildSettingsKey]: string } = {
 	bridgeReturnPendingHint: "DSH 正在验证授权并保存账户，请保持此页打开。",
 	bridgeReturnFailure: "Claude 登录未完成",
 	bridgeReturnFailureHint: "请回到原来的 DSH 设置页面，检查账户状态并重试登录。",
+	bridgeReturnUnconfirmed: "暂未确认登录结果",
+	bridgeReturnUnconfirmedHint:
+		"此页未能及时确认登录结果。请先查看原来的 DSH 设置页面中的账户状态，再决定是否重新登录。",
 	bridgeReturnClose: "关闭此页",
 	signedIn: "已登录",
 	requestFailed: "账户请求失败。",
